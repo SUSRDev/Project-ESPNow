@@ -1,0 +1,21 @@
+# Build
+build/
+*.map
+
+# IDE
+.vscode/
+.idea/
+*.user
+
+# Temp / local tools output
+Project-ESPNow/tools/_*.py
+Project-ESPNow/tools/_*.txt
+Project-ESPNow/tools/miss.txt
+__pycache__/
+*.pyc
+
+# Misc local
+大改的重构固件.ino.remove
+原作者空间.txt
+shapaper_blog.txt
+qr_to_text.py

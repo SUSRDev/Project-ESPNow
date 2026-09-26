@@ -39,10 +39,10 @@
 #define RESET_BUTTON_H 10  // 重置按钮高度
 
 // 颜色按钮位置和大小 (收窄并靠左)
-#define COLOR_BUTTON_WIDTH 15                                      // 颜色按钮宽度 (收窄)
-#define COLOR_BUTTON_HEIGHT 10                                     // 颜色按钮高度
-#define COLOR_BUTTON_START_Y (RESET_BUTTON_Y + RESET_BUTTON_H + 2) // 颜色按钮起始 Y 坐标 (更紧凑)
-#define COLOR_BUTTON_SPACING 2                                     // 颜色按钮间距
+#define COLOR_BUTTON_WIDTH 20                                      // 颜色按钮宽度
+#define COLOR_BUTTON_HEIGHT 16                                     // 颜色按钮高度
+#define COLOR_BUTTON_START_Y (RESET_BUTTON_Y + RESET_BUTTON_H + 3) // 颜色按钮起始 Y
+#define COLOR_BUTTON_SPACING 3                                     // 颜色按钮间距
 
 // 橡皮擦按钮位置和大小 (圆形)
 #define ERASER_BUTTON_X (RESET_BUTTON_X + COLOR_BUTTON_WIDTH / 2) // 橡皮擦按钮中心 X 坐标 (与颜色按钮对齐)
@@ -60,6 +60,31 @@
 #define SCREENSHOT_BUTTON_Y (SCREEN_HEIGHT - COLOR_BUTTON_HEIGHT - 2) // 截屏按钮 Y 坐标 (更靠下)
 #define SCREENSHOT_BUTTON_W COLOR_BUTTON_WIDTH                      // 截屏按钮宽度
 #define SCREENSHOT_BUTTON_H COLOR_BUTTON_HEIGHT                     // 截屏按钮高度
+
+// 画布翻页按钮（截屏左侧）
+#define CANVAS_PAGE_BTN_W COLOR_BUTTON_WIDTH
+#define CANVAS_PAGE_BTN_H COLOR_BUTTON_HEIGHT
+#define CANVAS_PAGE_NEXT_X (SCREENSHOT_BUTTON_X - CANVAS_PAGE_BTN_W - 2)
+#define CANVAS_PAGE_PREV_X (CANVAS_PAGE_NEXT_X - CANVAS_PAGE_BTN_W - 2)
+#define CANVAS_PAGE_CLEAR_X (CANVAS_PAGE_PREV_X - CANVAS_PAGE_BTN_W - 2) // 仅清当前页
+#define CANVAS_PAGE_BTN_Y SCREENSHOT_BUTTON_Y
+#define CANVAS_MAX_PAGES 8
+
+// 画布页控制动作（SyncMessage.touch_data.color）
+#define CANVAS_PAGE_ACT_CREATE 1
+#define CANVAS_PAGE_ACT_DELETE 2
+#define CANVAS_PAGE_ACT_INFO   3 // 仅同步页数，不强制切页
+#define CANVAS_PAGE_ACT_CLEAR  4 // 仅清空指定页笔迹，不删页
+
+// 在线列表刷新间隔
+#define ONLINE_PANEL_REFRESH_MS 500UL
+
+// 左侧信号强度显示
+#define SIGNAL_INFO_X 2
+#define SIGNAL_INFO_Y (RECEIVE_PROGRESS_Y + PROGRESS_CIRCLE_RADIUS + 6)
+#define SIGNAL_INFO_W 40
+#define SIGNAL_INFO_H 36
+#define SIGNAL_PEER_ROTATE_MS 5000UL
 
 // 橡皮擦相关常量
 #define ERASER_COLOR TFT_WHITE      // 橡皮擦颜色 (白色)
@@ -85,6 +110,20 @@
 #define CUSTOM_COLOR_BUTTON_W COLOR_BUTTON_WIDTH                      // 自定义颜色按钮宽度 (与普通颜色按钮相同)
 #define CUSTOM_COLOR_BUTTON_H COLOR_BUTTON_HEIGHT                     // 自定义颜色按钮高度 (与普通颜色按钮相同)
 
+// 笔粗细按钮（* 下方）
+#define BRUSH_BUTTON_X CUSTOM_COLOR_BUTTON_X
+#define BRUSH_BUTTON_Y (CUSTOM_COLOR_BUTTON_Y + CUSTOM_COLOR_BUTTON_H + 4)
+#define BRUSH_BUTTON_W CUSTOM_COLOR_BUTTON_W
+#define BRUSH_BUTTON_H CUSTOM_COLOR_BUTTON_H
+#define BRUSH_MIN_RADIUS 1
+#define BRUSH_MAX_RADIUS 12
+#define BRUSH_SLIDER_X (BRUSH_BUTTON_X - 14)
+#define BRUSH_SLIDER_Y (BRUSH_BUTTON_Y + BRUSH_BUTTON_H / 2)
+#define BRUSH_SLIDER_WIDTH 6
+#define BRUSH_SLIDER_HEIGHT 70
+#define BRUSH_SLIDER_HANDLE_W 10
+#define BRUSH_SLIDER_HANDLE_H 8
+
 // 返回按钮 (调色界面中使用) 位置和大小
 #define BACK_BUTTON_X (SCREEN_WIDTH - COLOR_BUTTON_WIDTH - 4)     // 返回按钮 X 坐标 (屏幕右侧)
 #define BACK_BUTTON_Y (SCREEN_HEIGHT - COLOR_BUTTON_HEIGHT - 4) // 返回按钮 Y 坐标 (屏幕右下角)
@@ -107,14 +146,13 @@
 
 // ESP-NOW 通信相关常量
 #define BROADCAST_INTERVAL 2000             // MAC 地址发现广播间隔 (毫秒)
-#define UPTIME_INFO_BROADCAST_INTERVAL 5000 // Uptime 信息广播间隔 (毫秒)
+#define DEBUG_INFO_UPDATE_INTERVAL 500      // 调试信息更新间隔 (毫秒) — 降低刷屏开销
+#define UPTIME_INFO_BROADCAST_INTERVAL 2000 // 加快 reboot 后画板恢复
 
-// UI 更新相关常量
-#define DEBUG_INFO_UPDATE_INTERVAL 200      // 调试信息更新间隔 (毫秒)
-
-// 调色界面相关常量
-#define COLOR_SLIDER_WIDTH 20                               // 颜色滑块宽度
-#define COLOR_SLIDER_HEIGHT ((SCREEN_HEIGHT - 10) / 3)      // 单个颜色滑块高度
+// 调色界面相关常量 — 加宽滑条，底部留给返回键
+#define COLOR_SLIDER_WIDTH 36
+#define COLOR_SLIDER_TOUCH_PAD 28   // 触控向左扩展，边缘好点
+#define COLOR_SLIDER_HEIGHT ((SCREEN_HEIGHT - BACK_BUTTON_H - 16) / 3)
 
 // LED 调光相关常量 (息屏状态下)
 #define BLUE_LED_DIM_DUTY_CYCLE 14 // 蓝色 LED 息屏时亮度 (PWM duty cycle, 0-255), 约 5% (14/255)
@@ -125,18 +163,25 @@
 #define TOUCH_STROKE_INTERVAL 50
 
 // ESP-NOW 同步逻辑相关常量
-#define MIN_UPTIME_DIFF_FOR_NEW_SYNC_TARGET 200UL // 选择新的同步目标时，对端设备最小原始运行时间差异 (毫秒) - 用于迟滞判断
-#define EFFECTIVE_UPTIME_SYNC_THRESHOLD 1000UL    // 有效运行时间同步阈值 (毫秒) - 在此阈值内的差异不触发新的同步以避免抖动
+#define MIN_UPTIME_DIFF_FOR_NEW_SYNC_TARGET 2000UL // 更换同步源的最小 uptime 差异
+#define EFFECTIVE_UPTIME_SYNC_THRESHOLD 3000UL     // 有效运行时间差阈值
+#define CANVAS_RESYNC_COOLDOWN_MS 15000UL          // 同步成功后短冷却，避免连环 restore
 
 // 心跳包相关常量
-#define HEARTBEAT_SEND_INTERVAL_MS 5000UL // 心跳包发送间隔 (毫秒)
-#define HEARTBEAT_TIMEOUT_MS 10000UL      // 心跳超时时间 (毫秒)，10秒
+#define HEARTBEAT_SEND_INTERVAL_MS 3000UL // 心跳包发送间隔 (毫秒)
+#define HEARTBEAT_TIMEOUT_MS 12000UL      // 心跳超时
 
-// 调试信息切换按钮位置和大小
-#define DEBUG_TOGGLE_BUTTON_X 2                     // 按钮 X 坐标 (左下角)
-#define DEBUG_TOGGLE_BUTTON_W 20                    // 按钮宽度
-#define DEBUG_TOGGLE_BUTTON_H 20                    // 按钮高度
-#define DEBUG_TOGGLE_BUTTON_Y (SCREEN_HEIGHT - DEBUG_TOGGLE_BUTTON_H - 2) // 按钮 Y 坐标
+// 调试信息切换按钮位置 (C/D 已移除，仅作聊天按钮锚点)
+#define DEBUG_TOGGLE_BUTTON_X 2
+#define DEBUG_TOGGLE_BUTTON_W 20
+#define DEBUG_TOGGLE_BUTTON_H 20
+#define DEBUG_TOGGLE_BUTTON_Y (SCREEN_HEIGHT - DEBUG_TOGGLE_BUTTON_H - 2)
+
+// 加入聊天室按钮 — 放在原 D 左下角位置
+#define CHAT_BUTTON_X DEBUG_TOGGLE_BUTTON_X
+#define CHAT_BUTTON_W DEBUG_TOGGLE_BUTTON_W
+#define CHAT_BUTTON_H DEBUG_TOGGLE_BUTTON_H
+#define CHAT_BUTTON_Y DEBUG_TOGGLE_BUTTON_Y
 
 // 圆形进度条相关定义
 #define PROGRESS_CIRCLE_RADIUS 8
@@ -155,10 +200,40 @@
 #define INFO_BUTTON_X (2 + 120 - INFO_BUTTON_W - 2) // 调试信息框 (startX=2, width=120) 右上角
 #define INFO_BUTTON_Y (SCREEN_HEIGHT - 42 - INFO_BUTTON_H - 2) // 调试信息框 (startY=SCREEN_HEIGHT-42) 上方
 
-// "Coffee" 按钮 (调试按钮上方)
+// "Coffee" 按钮 (聊天按钮上方)
 #define COFFEE_BUTTON_X DEBUG_TOGGLE_BUTTON_X      // 与调试按钮 X 坐标相同
 #define COFFEE_BUTTON_W DEBUG_TOGGLE_BUTTON_W      // 与调试按钮宽度相同
 #define COFFEE_BUTTON_H COFFEE_BUTTON_W      // 与调试按钮高度相同
-#define COFFEE_BUTTON_Y (DEBUG_TOGGLE_BUTTON_Y - COFFEE_BUTTON_H - 2) // 在调试按钮上方，间隔2像素
+#define COFFEE_BUTTON_Y (CHAT_BUTTON_Y - COFFEE_BUTTON_H - 2) // 在聊天按钮上方
+
+// 群聊 / 私聊 / 群组
+#define CHAT_TEXT_MAX 64
+#define CHAT_HISTORY_MAX 40
+#define CHAT_ROOM_NAME "大厅"
+#define CHAT_MAX_GROUPS 6
+#define CHAT_GROUP_NAME_MAX 12
+#define CHAT_MODE_PUBLIC  0
+#define CHAT_MODE_PRIVATE 1
+#define CHAT_MODE_GROUP   2
+#define DEVICE_ID_MAX_LEN 8
+#define DEVICE_ID_PREF_NAMESPACE "espnow"
+#define DEVICE_ID_PREF_KEY "devid"
+#define DEVICE_ID_LONG_PRESS_MS 800UL
+
+// 状态条 / Toast (避开左上按钮与右上 * 颜色按钮)
+#define STATUS_BAR_X 40
+#define STATUS_BAR_Y 1
+#define STATUS_BAR_W (SCREEN_WIDTH - 80)
+#define STATUS_BAR_H 16
+#define STATUS_TOAST_MS 2800UL
+#define DRAWING_STATUS_MS 1600UL
+
+// 左侧 UI 保护区 (橡皮擦不可覆盖)
+#define UI_LEFT_SAFE_X_MAX 38
+#define UI_LEFT_SAFE_Y_MAX (RECEIVE_PROGRESS_Y + PROGRESS_CIRCLE_RADIUS + 4)
+
+// SD 检测优化：启动后延迟探测，避免白屏卡死
+#define SD_DETECT_DELAY_MS 1200UL
+#define SD_SPI_HZ 4000000UL
 
 #endif // CONFIG_H

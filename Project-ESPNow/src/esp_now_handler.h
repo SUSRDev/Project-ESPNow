@@ -25,9 +25,24 @@ enum MessageType_e // 使用 _e 后缀表示 enum
     MSG_TYPE_CLEAR_AND_REQUEST_UPDATE,
     MSG_TYPE_RESET_CANVAS,
     MSG_TYPE_SYNC_START, // 新增：同步开始信号
-    MSG_TYPE_HEARTBEAT   // 新增：心跳包
+    MSG_TYPE_HEARTBEAT,  // 新增：心跳包
+    MSG_TYPE_CHAT,       // 聊天文本（大厅/私聊/群）
+    MSG_TYPE_CHAT_JOIN,  // 加入通知
+    MSG_TYPE_CHAT_GROUP, // 群组控制：创建/解散（text 携带协议）
+    MSG_TYPE_CANVAS_PAGE // 画布翻页/新建/删空页（touch_data 携带页信息）
 };
 typedef enum MessageType_e MessageType_t; // Typedef for the enum
+
+// 独立聊天包 (与 SyncMessage 分开发送，避免拖大绘图包)
+typedef struct ChatPacket_s {
+    MessageType_t type;
+    uint8_t mode;          // CHAT_MODE_PUBLIC / PRIVATE / GROUP
+    uint16_t textColor;    // RGB565 文字颜色
+    char senderId[DEVICE_ID_MAX_LEN + 1];
+    char targetId[DEVICE_ID_MAX_LEN + 1]; // 私聊=对方ID；群聊=群ID；大厅可空
+    char text[CHAT_TEXT_MAX + 1];
+    uint32_t timestamp;
+} ChatPacket_t;
 
 typedef struct SyncMessage_s
 {
@@ -38,6 +53,7 @@ typedef struct SyncMessage_s
     uint16_t totalPointsForSync; // 新增：用于同步开始时告知总点数
     uint32_t usedMemory;         // 新增：发送方已用内存 (字节)
     uint32_t totalMemory;        // 新增：发送方总内存 (字节)
+    char senderId[DEVICE_ID_MAX_LEN + 1]; // 设备短标识，如 "WZL"
 } SyncMessage_t;
 
 // 新增：存储对端详细信息的结构体
@@ -46,6 +62,8 @@ typedef struct PeerInfo_s {
     unsigned long effectiveUptime;
     uint32_t usedMemory;
     uint32_t totalMemory;
+    char deviceId[DEVICE_ID_MAX_LEN + 1]; // 对端短标识
+    int8_t rssi;                          // 最近一次收到该对端包的 RSSI (dBm)
 } PeerInfo_t;
 
 
@@ -79,14 +97,17 @@ extern unsigned long lastRemoteDrawTime; // 远程最后绘制时间 (用于以�
 
 // 函数声明
 void espNowInit(); // ESP-NOW 初始化
-void OnSyncDataSent(const uint8_t *mac_addr, esp_now_send_status_t status); // 发送回调
-void OnSyncDataRecv(const esp_now_recv_info *info, const uint8_t *incomingDataPtr, int len); // 接收回调
+void OnSyncDataSent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status); // 发送回调 (ESP32 Arduino 3.x)
+void OnSyncDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingDataPtr, int len); // 接收回调
 void sendSyncMessage(const SyncMessage_t *msg); // 发送同步消息的辅助函数
 void processIncomingMessages(); // 处理接收到的消息队列
 void replayAllDrawings();       // 重播所有绘图历史 (需要 tft 对象)
 void sendHeartbeat(); // 新增：发送心跳包
 void checkPeerHeartbeatTimeout(); // 新增：检查对端心跳超时
 std::vector<PeerInfo_t> getPeerInfoList(); // 新增：获取对端信息列表
+void sendChatPacket(MessageType_t type, const char *text); // 兼容：发到大厅
+void sendChatEx(MessageType_t type, uint8_t mode, const char *targetId, const char *text, uint16_t color);
+void processIncomingChatPacket(const ChatPacket_t &pkt); // 处理聊天包
 
 // 注意: replayAllDrawings 函数依赖于在 esp_now_handler.cpp 中可访问的全局 tft 对象和 drawMainInterface 函数。
 

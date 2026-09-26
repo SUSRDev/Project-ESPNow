@@ -13,7 +13,9 @@ typedef struct TouchData_s // 使用 _s 后缀表示 struct，_t 用于 typedef 
     int y;                   // 映射到屏幕的Y坐标 (用于绘图)
     unsigned long timestamp; // 绘图动作的时间戳 (本地绘制时的 millis())
     bool isReset;            // 如果此操作是清屏重置，则为 true
-    uint32_t color;          // 绘图颜色
+    uint32_t color;          // 绘图颜色 (TFT_BLACK = 橡皮)
+    uint8_t brushR;          // 笔/橡皮半径；0=旧包（笔按1px，橡皮用本机默认）
+    uint8_t page;            // 画布页码（从 0 起）；不同页互不影响
 } TouchData_t;
 
 

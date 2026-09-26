@@ -8,6 +8,7 @@
 #include "touch_handler.h" // For TS_Point type
 #include <vector> // 用于 getPeerInfoList 返回值
 #include <map> // 用于 std::map
+#include <set>
 
 // TFT_eSPI tft 对象和 drawMainInterface 函数在 Project-ESPNow.ino 中定义
 // 通过 extern 声明来在此文件中使用它们
@@ -18,6 +19,82 @@ extern void clearScreenAndCache();
 
 // 来自 ui_manager 的外部变量
 extern int eraserRadius; // 当前橡皮擦半径
+extern char localDeviceId[DEVICE_ID_MAX_LEN + 1];
+extern UIState_t currentUIState;
+extern bool inCustomColorMode;
+extern bool pendingCanvasRedrawAfterChat; // 非花瓣画板界面时延后笔迹/restore 重绘
+
+static std::set<String> canvasSyncedPeers;
+static std::map<String, unsigned long> lastCanvasSyncMs;
+static std::map<String, unsigned long> peerLastRawUptimeSeen;
+
+static String macKeyFromLastPeer()
+{
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             lastPeerMac[0], lastPeerMac[1], lastPeerMac[2],
+             lastPeerMac[3], lastPeerMac[4], lastPeerMac[5]);
+    return String(macStr);
+}
+
+// 笔迹与 restore 只允许出现在花瓣画板主界面
+static bool isCanvasBoardActive()
+{
+    return currentUIState == UI_STATE_MAIN && !inCustomColorMode;
+}
+
+static bool shouldSkipCanvasPaint()
+{
+    return !isCanvasBoardActive();
+}
+
+static void markPeerCanvasSynced(const String &peerKey)
+{
+    canvasSyncedPeers.insert(peerKey);
+    lastCanvasSyncMs[peerKey] = millis();
+}
+
+static void clearPeerCanvasSyncState(const String &peerKey)
+{
+    canvasSyncedPeers.erase(peerKey);
+    lastCanvasSyncMs.erase(peerKey);
+}
+
+static bool peerNeedsCanvasSync(const String &peerKey)
+{
+    // 仅在「已成功同步」后短冷却；未成功完成的不算
+    if (canvasSyncedPeers.count(peerKey)) {
+        auto it = lastCanvasSyncMs.find(peerKey);
+        if (it != lastCanvasSyncMs.end() && (millis() - it->second) < CANVAS_RESYNC_COOLDOWN_MS)
+            return false;
+        // 冷却过期：允许再次评估（例如对端 reboot 后）
+        clearPeerCanvasSyncState(peerKey);
+    }
+    return true;
+}
+
+// 检测对端 reboot：uptime 明显回落则强制允许恢复
+static void detectPeerRebootAndAllowResync(const String &peerKey, unsigned long peerRawUptime)
+{
+    auto it = peerLastRawUptimeSeen.find(peerKey);
+    if (it != peerLastRawUptimeSeen.end()) {
+        unsigned long prev = it->second;
+        // 对端曾运行较久，突然变成很小 uptime → 视为重启
+        if (prev > 20000UL && peerRawUptime + 3000UL < prev) {
+            clearPeerCanvasSyncState(peerKey);
+            Serial.println("检测到对端 reboot，允许立即画板恢复");
+        }
+    }
+    peerLastRawUptimeSeen[peerKey] = peerRawUptime;
+}
+
+static void applySenderId(SyncMessage_t *msg)
+{
+    if (!msg)
+        return;
+    strncpy(msg->senderId, localDeviceId, DEVICE_ID_MAX_LEN);
+    msg->senderId[DEVICE_ID_MAX_LEN] = '\0';
+}
 
 // 定义在 esp_now_handler.h 中声明的全局变量
 esp_now_peer_info_t broadcastPeerInfo;
@@ -55,6 +132,37 @@ static uint16_t totalPointsExpectedFromPeer = 0;
 // 触摸点处理相关 (用于远程点绘制)
 TS_Point lastRemotePoint = {0, 0, 0}; // 远程最后一点
 unsigned long lastRemoteDrawTime = 0; // 远程最后绘制时间
+static uint32_t lastRemoteColor = 0;  // 用于橡皮/画笔分段，避免跨笔触连线误擦
+static uint8_t lastRemotePage = 0;    // 远程最后一点所在页，跨页不断笔
+
+static void bumpCanvasPageCountFromPoint(uint8_t page)
+{
+    if (page >= CANVAS_MAX_PAGES)
+        return;
+    uint8_t need = (uint8_t)(page + 1);
+    if (need > canvasPageCount)
+        canvasPageCount = need;
+}
+
+static void refreshCanvasPageCountFromHistory()
+{
+    uint8_t maxP = 0;
+    const size_t n = allDrawingHistory.size();
+    for (size_t i = 0; i < n; i++) {
+        const TouchData_t &d = allDrawingHistory[i];
+        if (!d.isReset && d.page > maxP)
+            maxP = d.page;
+    }
+    uint8_t need = (uint8_t)(maxP + 1);
+    if (need < 1)
+        need = 1;
+    if (need > CANVAS_MAX_PAGES)
+        need = CANVAS_MAX_PAGES;
+    if (need > canvasPageCount)
+        canvasPageCount = need;
+    if (currentCanvasPage >= canvasPageCount)
+        currentCanvasPage = (uint8_t)(canvasPageCount - 1);
+}
 // unsigned long touchInterval = 50;     // 触摸笔划间隔阈值 (毫秒) -> 已移至 config.h 作为 TOUCH_STROKE_INTERVAL
 
 // ESP-NOW 初始化函数
@@ -90,14 +198,18 @@ void espNowInit()
     }
 }
 
-// ESP-NOW 数据发送回调函数
-void OnSyncDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
+// ESP-NOW 数据发送回调函数 (ESP32 Arduino Core 3.x: wifi_tx_info_t)
+void OnSyncDataSent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
 {
     if (status != ESP_NOW_SEND_SUCCESS)
     {
-        char macStr[18];
-        snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+        const uint8_t *mac_addr = (tx_info && tx_info->des_addr) ? tx_info->des_addr : nullptr;
+        char macStr[18] = "??:??:??:??:??:??";
+        if (mac_addr)
+        {
+            snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+        }
         Serial.print("发送到 ");
         Serial.print(macStr);
         Serial.print(" 失败。状态: ");
@@ -106,29 +218,103 @@ void OnSyncDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 }
 
 // ESP-NOW 数据接收回调函数
-void OnSyncDataRecv(const esp_now_recv_info *info, const uint8_t *incomingDataPtr, int len)
+void OnSyncDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingDataPtr, int len)
 {
     if (len == sizeof(SyncMessage_t))
     {
         SyncMessage_t receivedMsg;
         memcpy(&receivedMsg, incomingDataPtr, sizeof(receivedMsg));
+        receivedMsg.senderId[DEVICE_ID_MAX_LEN] = '\0';
         memcpy(lastPeerMac, info->src_addr, 6); // 更新最后通信的对端 MAC
 
         char macStr[18];
         snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
                  info->src_addr[0], info->src_addr[1], info->src_addr[2],
                  info->src_addr[3], info->src_addr[4], info->src_addr[5]);
-        macSet.insert(String(macStr)); // 添加到 MAC 地址集合中用于计数
-        peerLastHeartbeat[String(macStr)] = millis(); // 更新对端的最后心跳时间
+        String macKey = String(macStr);
+        bool isNewPeer = (peerInfoMap.find(macKey) == peerInfoMap.end());
+
+        macSet.insert(macKey); // 添加到 MAC 地址集合中用于计数
+        peerLastHeartbeat[macKey] = millis(); // 更新对端的最后心跳时间
 
         // 更新或添加对端详细信息
-        peerInfoMap[String(macStr)].macAddress = String(macStr);
-        peerInfoMap[String(macStr)].effectiveUptime = receivedMsg.senderUptime + receivedMsg.senderOffset;
-        peerInfoMap[String(macStr)].usedMemory = receivedMsg.usedMemory;
-        peerInfoMap[String(macStr)].totalMemory = receivedMsg.totalMemory;
+        peerInfoMap[macKey].macAddress = macKey;
+        peerInfoMap[macKey].effectiveUptime = receivedMsg.senderUptime + receivedMsg.senderOffset;
+        peerInfoMap[macKey].usedMemory = receivedMsg.usedMemory;
+        peerInfoMap[macKey].totalMemory = receivedMsg.totalMemory;
+        if (info->rx_ctrl) {
+            peerInfoMap[macKey].rssi = info->rx_ctrl->rssi;
+        }
+        if (receivedMsg.senderId[0]) {
+            strncpy(peerInfoMap[macKey].deviceId, receivedMsg.senderId, DEVICE_ID_MAX_LEN);
+            peerInfoMap[macKey].deviceId[DEVICE_ID_MAX_LEN] = '\0';
+            // 对端 ID 与本机相同 → 冲突提示
+            if (localDeviceId[0]) {
+                const char *a = localDeviceId;
+                const char *b = receivedMsg.senderId;
+                bool conflict = true;
+                while (*a && *b) {
+                    char ca = (*a >= 'a' && *a <= 'z') ? (*a - 'a' + 'A') : *a;
+                    char cb = (*b >= 'a' && *b <= 'z') ? (*b - 'a' + 'A') : *b;
+                    if (ca != cb) { conflict = false; break; }
+                    a++;
+                    b++;
+                }
+                if (conflict && (*a || *b))
+                    conflict = false;
+                if (conflict) {
+                    char tip[40];
+                    snprintf(tip, sizeof(tip), "标识冲突:%s", receivedMsg.senderId);
+                    showStatusToast(tip, 3000);
+                    if (currentUIState == UI_STATE_NAME_EDIT)
+                        drawNameEditScreen();
+                }
+            }
+        } else if (peerInfoMap[macKey].deviceId[0] == '\0') {
+            snprintf(peerInfoMap[macKey].deviceId, sizeof(peerInfoMap[macKey].deviceId),
+                     "%02X%02X", info->src_addr[4], info->src_addr[5]);
+        }
 
+        if (isNewPeer) {
+            // 对端重新出现：清同步标记，马上发一次 UPTIME 触发恢复
+            clearPeerCanvasSyncState(macKey);
+            peerJoinedNotify(peerInfoMap[macKey].deviceId);
+            SyncMessage_t urgent;
+            memset(&urgent, 0, sizeof(urgent));
+            urgent.type = MSG_TYPE_UPTIME_INFO;
+            urgent.senderUptime = millis();
+            urgent.senderOffset = relativeBootTimeOffset;
+            applySenderId(&urgent);
+            sendSyncMessage(&urgent);
+        }
 
         incomingMessageQueue.push(receivedMsg); // 将消息放入队列等待处理
+    }
+    else if (len == sizeof(ChatPacket_t))
+    {
+        ChatPacket_t chatPkt;
+        memcpy(&chatPkt, incomingDataPtr, sizeof(chatPkt));
+        chatPkt.senderId[DEVICE_ID_MAX_LEN] = '\0';
+        chatPkt.targetId[DEVICE_ID_MAX_LEN] = '\0';
+        chatPkt.text[CHAT_TEXT_MAX] = '\0';
+
+        char macStr[18];
+        snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 info->src_addr[0], info->src_addr[1], info->src_addr[2],
+                 info->src_addr[3], info->src_addr[4], info->src_addr[5]);
+        String macKey = String(macStr);
+        macSet.insert(macKey);
+        peerLastHeartbeat[macKey] = millis();
+        if (info->rx_ctrl) {
+            peerInfoMap[macKey].rssi = info->rx_ctrl->rssi;
+        }
+        peerInfoMap[macKey].macAddress = macKey;
+        if (chatPkt.senderId[0]) {
+            strncpy(peerInfoMap[macKey].deviceId, chatPkt.senderId, DEVICE_ID_MAX_LEN);
+            peerInfoMap[macKey].deviceId[DEVICE_ID_MAX_LEN] = '\0';
+        }
+
+        processIncomingChatPacket(chatPkt);
     }
     else if (len == strlen("XX:XX:XX:XX:XX:XX") && incomingDataPtr[0] != '{')
     {
@@ -136,8 +322,15 @@ void OnSyncDataRecv(const esp_now_recv_info *info, const uint8_t *incomingDataPt
         char macStr[18];
         memcpy(macStr, incomingDataPtr, len);
         macStr[len] = '\0';
-        macSet.insert(String(macStr));
-        peerLastHeartbeat[String(macStr)] = millis(); // 更新对端的最后心跳时间
+        String macKey = String(macStr);
+        bool isNewPeer = (peerInfoMap.find(macKey) == peerInfoMap.end());
+        macSet.insert(macKey);
+        peerLastHeartbeat[macKey] = millis(); // 更新对端的最后心跳时间
+        if (isNewPeer) {
+            peerInfoMap[macKey].macAddress = macKey;
+            peerInfoMap[macKey].deviceId[0] = '\0';
+            peerJoinedNotify(macStr);
+        }
         // 对于旧版消息，我们没有内存信息，只更新心跳
     }
     else
@@ -152,12 +345,14 @@ void OnSyncDataRecv(const esp_now_recv_info *info, const uint8_t *incomingDataPt
 // 发送同步消息的辅助函数
 void sendSyncMessage(const SyncMessage_t *msg)
 {
+    SyncMessage_t out = *msg;
+    applySenderId(&out);
     // 调用前应确保 msg->senderUptime 和 msg->senderOffset 已正确设置
-    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)msg, sizeof(SyncMessage_t));
+    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&out, sizeof(SyncMessage_t));
     if (result != ESP_OK)
     {
         Serial.print("发送 SyncMessage 类型 ");
-        Serial.print(msg->type);
+        Serial.print(out.type);
         Serial.print(" 错误: ");
         Serial.println(esp_err_to_name(result));
     }
@@ -187,53 +382,25 @@ void processIncomingMessages()
         {
         case MSG_TYPE_UPTIME_INFO:
         {
-            Serial.println("收到 MSG_TYPE_UPTIME_INFO");
-            if (uptimeOfLastPeerSyncedFrom != 0 && !iamRequestingAllData)
-            {
-                unsigned long diffFromLastSyncSource = (peerRawUptime > uptimeOfLastPeerSyncedFrom) ? (peerRawUptime - uptimeOfLastPeerSyncedFrom) : (uptimeOfLastPeerSyncedFrom - peerRawUptime);
-                if (diffFromLastSyncSource < MIN_UPTIME_DIFF_FOR_NEW_SYNC_TARGET)
-                {
-                    Serial.print("  迟滞判断: 对端原始运行时间 (");
-                    Serial.print(peerRawUptime);
-                    Serial.print(") 与上次同步源的原始运行时间 (");
-                    Serial.print(uptimeOfLastPeerSyncedFrom);
-                    Serial.print(") 差异 ");
-                    Serial.print(diffFromLastSyncSource);
-                    Serial.print("ms < ");
-                    Serial.print(MIN_UPTIME_DIFF_FOR_NEW_SYNC_TARGET);
-                    Serial.println("ms。跳过对此对端的完整同步评估。");
-                    if (lastKnownPeerUptime != peerRawUptime || lastKnownPeerOffset != peerReceivedOffset)
-                    {
-                        lastKnownPeerUptime = peerRawUptime;
-                        lastKnownPeerOffset = peerReceivedOffset;
-                        initialSyncLogicProcessed = false;
-                    }
-                    if (!initialSyncLogicProcessed)
-                        initialSyncLogicProcessed = true;
-                    break;
-                }
+            // 例行心跳式 UPTIME：只更新对端信息；reboot 检测后允许立即恢复
+            lastKnownPeerUptime = peerRawUptime;
+            lastKnownPeerOffset = peerReceivedOffset;
+            initialSyncLogicProcessed = true;
+
+            String peerKey = macKeyFromLastPeer();
+            detectPeerRebootAndAllowResync(peerKey, peerRawUptime);
+            if (!peerNeedsCanvasSync(peerKey)) {
+                break;
             }
 
-            if (lastKnownPeerUptime != peerRawUptime || lastKnownPeerOffset != peerReceivedOffset || !initialSyncLogicProcessed)
-            {
-                lastKnownPeerUptime = peerRawUptime;
-                lastKnownPeerOffset = peerReceivedOffset;
+            Serial.println("收到 MSG_TYPE_UPTIME_INFO (首次与该对端同步评估)");
 
+            {
                 Serial.println("  处理 UPTIME_INFO 进行同步决策。");
                 Serial.print("  本地有效运行时间: ");
                 Serial.print(localEffectiveUptime);
-                Serial.print(" (原始: ");
-                Serial.print(localCurrentRawUptime);
-                Serial.print(", 偏移: ");
-                Serial.print(localCurrentOffset);
-                Serial.println(")");
                 Serial.print("  对端有效运行时间: ");
-                Serial.print(peerEffectiveUptime);
-                Serial.print(" (原始: ");
-                Serial.print(peerRawUptime);
-                Serial.print(", 偏移: ");
-                Serial.print(peerReceivedOffset);
-                Serial.println(")");
+                Serial.println(peerEffectiveUptime);
 
                 if (localEffectiveUptime == peerEffectiveUptime)
                 {
@@ -241,42 +408,30 @@ void processIncomingMessages()
                     esp_wifi_get_mac(WIFI_IF_STA, myMacAddr);
                     if (memcmp(myMacAddr, lastPeerMac, 6) < 0)
                     {
-                        Serial.println("  决策 (有效运行时间相同, MAC较小): 本机行为类似较新设备：清空并请求数据。");
+                        Serial.println("  决策 (有效运行时间相同, MAC较小): 本机请求数据。");
                         if (iamRequestingAllData || isReceivingDrawingData || isSendingDrawingData)
-                        {
-                            Serial.println("  但当前已有同步正在进行，忽略新的同步请求发起。");
-                            lastKnownPeerUptime = peerRawUptime; // 仍然更新对端信息
-                            lastKnownPeerOffset = peerReceivedOffset;
-                            initialSyncLogicProcessed = true; // 标记已处理此 UPTIME_INFO
-                            break;
-                        }
+                            break; // 忙则下次 UPTIME 再试，绝不提前标记成功
                         iamEffectivelyMoreUptimeDevice = false;
                         iamRequestingAllData = true;
-                        isAwaitingSyncStartResponse = true; // 等待对方的 SYNC_START
+                        isAwaitingSyncStartResponse = true;
                         allDrawingHistory.clear();
-                        // tft.fillScreen(TFT_BLACK); // 清屏操作移至收到对方 SYNC_START 后
-                        // drawMainInterface();
-
-                        // 发送同步开始信号，表明本机准备好请求并接收数据
                         SyncMessage_t syncStartMsgBeforeRequest;
                         syncStartMsgBeforeRequest.type = MSG_TYPE_SYNC_START;
                         syncStartMsgBeforeRequest.senderUptime = localCurrentRawUptime;
                         syncStartMsgBeforeRequest.senderOffset = localCurrentOffset;
                         memset(&syncStartMsgBeforeRequest.touch_data, 0, sizeof(TouchData_t));
                         sendSyncMessage(&syncStartMsgBeforeRequest);
-                        Serial.println("  发送 MSG_TYPE_SYNC_START (在请求所有绘图前)");
-
                         SyncMessage_t requestMsg;
                         requestMsg.type = MSG_TYPE_REQUEST_ALL_DRAWINGS;
                         requestMsg.senderUptime = localCurrentRawUptime;
                         requestMsg.senderOffset = localCurrentOffset;
                         memset(&requestMsg.touch_data, 0, sizeof(TouchData_t));
                         sendSyncMessage(&requestMsg);
-                        timeRequestSentForAllDrawings = millis(); // 记录发送请求的时间
+                        timeRequestSentForAllDrawings = millis();
                     }
                     else
                     {
-                        Serial.println("  决策 (有效运行时间相同, MAC较大/相等): 本机行为类似较旧设备：通知对端清空并请求数据。");
+                        Serial.println("  决策 (有效运行时间相同, MAC较大): 通知对端向我请求。");
                         iamEffectivelyMoreUptimeDevice = true;
                         iamRequestingAllData = false;
                         SyncMessage_t promptMsg;
@@ -285,54 +440,46 @@ void processIncomingMessages()
                         promptMsg.senderOffset = localCurrentOffset;
                         memset(&promptMsg.touch_data, 0, sizeof(TouchData_t));
                         sendSyncMessage(&promptMsg);
+                        markPeerCanvasSynced(peerKey); // 本机作为数据源侧
                     }
                 }
                 else
                 {
-                    unsigned long effectiveUptimeDifference = (localEffectiveUptime > peerEffectiveUptime) ? (localEffectiveUptime - peerEffectiveUptime) : (peerEffectiveUptime - localEffectiveUptime);
+                    unsigned long effectiveUptimeDifference = (localEffectiveUptime > peerEffectiveUptime)
+                        ? (localEffectiveUptime - peerEffectiveUptime)
+                        : (peerEffectiveUptime - localEffectiveUptime);
 
                     if (effectiveUptimeDifference <= EFFECTIVE_UPTIME_SYNC_THRESHOLD)
                     {
-                        Serial.println("  决策: 有效运行时间差在阈值内。不启动新的同步以避免抖动。");
+                        Serial.println("  决策: 有效运行时间差在阈值内，不同步。");
+                        markPeerCanvasSynced(peerKey);
                     }
                     else if (localEffectiveUptime < peerEffectiveUptime)
                     {
-                        Serial.println("  决策: 本机有效运行时间较短 (超出阈值)。判定本机为较新设备。清空本机数据并向对端 (较旧设备) 请求所有绘图数据。");
+                        Serial.println("  决策: 本机较新，向对端请求历史。");
                         if (iamRequestingAllData || isReceivingDrawingData || isSendingDrawingData)
-                        {
-                            Serial.println("  但当前已有同步正在进行，忽略新的同步请求发起。");
-                            lastKnownPeerUptime = peerRawUptime; // 仍然更新对端信息
-                            lastKnownPeerOffset = peerReceivedOffset;
-                            initialSyncLogicProcessed = true; // 标记已处理此 UPTIME_INFO
                             break;
-                        }
                         iamEffectivelyMoreUptimeDevice = false;
                         iamRequestingAllData = true;
-                        isAwaitingSyncStartResponse = true; // 等待对方的 SYNC_START
+                        isAwaitingSyncStartResponse = true;
                         allDrawingHistory.clear();
-                        // tft.fillScreen(TFT_BLACK); // 清屏操作移至收到对方 SYNC_START 后
-                        // drawMainInterface();
-
-                        // 发送同步开始信号，表明本机准备好请求并接收数据
                         SyncMessage_t syncStartMsgBeforeRequest2;
                         syncStartMsgBeforeRequest2.type = MSG_TYPE_SYNC_START;
                         syncStartMsgBeforeRequest2.senderUptime = localCurrentRawUptime;
                         syncStartMsgBeforeRequest2.senderOffset = localCurrentOffset;
                         memset(&syncStartMsgBeforeRequest2.touch_data, 0, sizeof(TouchData_t));
                         sendSyncMessage(&syncStartMsgBeforeRequest2);
-                        Serial.println("  发送 MSG_TYPE_SYNC_START (在请求所有绘图前 - UPTIME_INFO 路径)");
-
                         SyncMessage_t requestMsg;
                         requestMsg.type = MSG_TYPE_REQUEST_ALL_DRAWINGS;
                         requestMsg.senderUptime = localCurrentRawUptime;
                         requestMsg.senderOffset = localCurrentOffset;
                         memset(&requestMsg.touch_data, 0, sizeof(TouchData_t));
                         sendSyncMessage(&requestMsg);
-                        timeRequestSentForAllDrawings = millis(); // 记录发送请求的时间
+                        timeRequestSentForAllDrawings = millis();
                     }
                     else
-                    { // localEffectiveUptime > peerEffectiveUptime && diff > threshold
-                        Serial.println("  决策: 本机有效运行时间较长 (超出阈值)。判定本机为较旧设备。通知对端 (较新设备) 清空并向本机请求更新。");
+                    {
+                        Serial.println("  决策: 本机较旧，提示对端向我同步。");
                         iamEffectivelyMoreUptimeDevice = true;
                         iamRequestingAllData = false;
                         SyncMessage_t promptMsg;
@@ -341,13 +488,9 @@ void processIncomingMessages()
                         promptMsg.senderOffset = localCurrentOffset;
                         memset(&promptMsg.touch_data, 0, sizeof(TouchData_t));
                         sendSyncMessage(&promptMsg);
+                        markPeerCanvasSynced(peerKey);
                     }
                 }
-                initialSyncLogicProcessed = true;
-            }
-            else
-            {
-                // Serial.println("  收到 MSG_TYPE_UPTIME_INFO, 但已针对此对端 (raw uptime + offset) 处理过。忽略。");
             }
             break;
         }
@@ -356,77 +499,128 @@ void processIncomingMessages()
             TouchData_t currentPointData = msg.touch_data; // Declare once at the beginning of the case
             int mapX = currentPointData.x;
             int mapY = currentPointData.y;
+            const char *drawerId = msg.senderId[0] ? msg.senderId : "?";
+            bumpCanvasPageCountFromPoint(currentPointData.page);
+            const bool onViewPage = (currentPointData.page == currentCanvasPage);
+            const bool strokeContinue = (lastRemotePoint.z != 0 && lastRemotePage == currentPointData.page);
 
             if (isReceivingDrawingData)
             {
-                // 场景1: 正在进行历史数据同步 (本机是请求方，已收到 SYNC_START)
-                Serial.println("  处理 MSG_TYPE_DRAW_POINT 作为历史同步数据。");
-                allDrawingHistory.push_back(currentPointData); // 存储历史点
+                // 场景1: 历史同步 — 聊天界面打开时只收数据不画布，避免叠在聊天室上
+                allDrawingHistory.push_back(currentPointData);
                 receivedHistoryPointCount++;
-                updateReceiveProgress(receivedHistoryPointCount, totalPointsExpectedFromPeer);
-                // 绘图逻辑
-                if (currentPointData.color == TFT_BLACK) {
-                    // 橡皮擦操作：绘制可变半径的圆形
-                    tft.fillCircle(mapX, mapY, eraserRadius, TFT_BLACK);
+                if ((receivedHistoryPointCount & 15) == 0 || receivedHistoryPointCount >= totalPointsExpectedFromPeer) {
+                    if (!shouldSkipCanvasPaint())
+                        updateReceiveProgress(receivedHistoryPointCount, totalPointsExpectedFromPeer);
+                }
+                if (!shouldSkipCanvasPaint() && onViewPage) {
+                    if (currentPointData.color == TFT_BLACK) {
+                        int r = resolveEraserRadius(currentPointData.brushR);
+                        bool hitUi = false;
+                        if (strokeContinue && lastRemoteColor == TFT_BLACK &&
+                            (currentPointData.timestamp - lastRemoteDrawTime <= TOUCH_STROKE_INTERVAL)) {
+                            hitUi = applyEraserSegment(lastRemotePoint.x, lastRemotePoint.y,
+                                                       mapX, mapY, r);
+                        } else {
+                            hitUi = applyEraserDot(mapX, mapY, r);
+                        }
+                        if (hitUi)
+                            redrawUiChrome();
+                    } else {
+                        int r = resolveBrushRadius(currentPointData.brushR);
+                        if (!strokeContinue ||
+                            currentPointData.timestamp - lastRemoteDrawTime > TOUCH_STROKE_INTERVAL ||
+                            lastRemoteColor == TFT_BLACK)
+                            applyBrushDot(mapX, mapY, currentPointData.color, r);
+                        else
+                            applyBrushSegment(lastRemotePoint.x, lastRemotePoint.y, mapX, mapY,
+                                              currentPointData.color, r);
+                    }
+                } else if (!onViewPage) {
+                    // 其它页笔迹只入库，同步结束后按当前页重放
                 } else {
-                    // 普通绘图操作
-                    if (currentPointData.timestamp - lastRemoteDrawTime > TOUCH_STROKE_INTERVAL || lastRemotePoint.z == 0)
-                    {
-                        tft.drawPixel(mapX, mapY, currentPointData.color);
-                    }
-                    else
-                    {
-                        tft.drawLine(lastRemotePoint.x, lastRemotePoint.y, mapX, mapY, currentPointData.color);
-                    }
+                    pendingCanvasRedrawAfterChat = true;
                 }
                 lastRemotePoint.x = mapX;
                 lastRemotePoint.y = mapY;
                 lastRemotePoint.z = 1;
                 lastRemoteDrawTime = currentPointData.timestamp;
+                lastRemoteColor = currentPointData.color;
+                lastRemotePage = currentPointData.page;
                 if (!isScreenOn)
                     hasNewUpdateWhileScreenOff = true;
+                if ((receivedHistoryPointCount & 63) == 0)
+                    yield();
             }
             else if (!iamRequestingAllData && !isSendingDrawingData && !isAwaitingSyncStartResponse)
             {
-                // 场景2: 接收实时绘制点 (本机不处于任何请求/发送全量数据的状态)
-                Serial.println("  处理 MSG_TYPE_DRAW_POINT 作为实时新笔划。");
-                allDrawingHistory.push_back(currentPointData); // 实时点也需要加入历史
-                // 绘图逻辑
-                if (currentPointData.color == TFT_BLACK) {
-                    // 橡皮擦操作：绘制可变半径的圆形
-                    tft.fillCircle(mapX, mapY, eraserRadius, TFT_BLACK);
+                allDrawingHistory.push_back(currentPointData);
+                if (!shouldSkipCanvasPaint() && onViewPage) {
+                    setActivityStatus(drawerId,
+                                      currentPointData.color == TFT_BLACK ? "在擦" : "在画");
+                    if (currentPointData.color == TFT_BLACK) {
+                        int r = resolveEraserRadius(currentPointData.brushR);
+                        bool hitUi = false;
+                        if (strokeContinue && lastRemoteColor == TFT_BLACK &&
+                            (currentPointData.timestamp - lastRemoteDrawTime <= TOUCH_STROKE_INTERVAL)) {
+                            hitUi = applyEraserSegment(lastRemotePoint.x, lastRemotePoint.y,
+                                                       mapX, mapY, r);
+                        } else {
+                            hitUi = applyEraserDot(mapX, mapY, r);
+                        }
+                        if (hitUi)
+                            redrawUiChrome();
+                    } else {
+                        int r = resolveBrushRadius(currentPointData.brushR);
+                        if (!strokeContinue ||
+                            currentPointData.timestamp - lastRemoteDrawTime > TOUCH_STROKE_INTERVAL ||
+                            lastRemoteColor == TFT_BLACK)
+                            applyBrushDot(mapX, mapY, currentPointData.color, r);
+                        else
+                            applyBrushSegment(lastRemotePoint.x, lastRemotePoint.y, mapX, mapY,
+                                              currentPointData.color, r);
+                    }
+                } else if (!onViewPage) {
+                    // 对端在别的页编辑：只存历史，不污染当前页画面
                 } else {
-                    // 普通绘图操作
-                    if (currentPointData.timestamp - lastRemoteDrawTime > TOUCH_STROKE_INTERVAL || lastRemotePoint.z == 0)
-                    {
-                        tft.drawPixel(mapX, mapY, currentPointData.color);
-                    }
-                    else
-                    {
-                        tft.drawLine(lastRemotePoint.x, lastRemotePoint.y, mapX, mapY, currentPointData.color);
-                    }
+                    pendingCanvasRedrawAfterChat = true;
                 }
                 lastRemotePoint.x = mapX;
                 lastRemotePoint.y = mapY;
                 lastRemotePoint.z = 1;
                 lastRemoteDrawTime = currentPointData.timestamp;
+                lastRemoteColor = currentPointData.color;
+                lastRemotePage = currentPointData.page;
                 if (!isScreenOn)
                     hasNewUpdateWhileScreenOff = true;
             }
             else
             {
-                // 场景3: 正在等待同步开始、或本机正在发送数据、或本机正在请求但还未收到对方SYNC_START
-                Serial.print("  收到 MSG_TYPE_DRAW_POINT 但本机处于中间同步状态 (");
-                Serial.print("iamRequestingAllData: ");
-                Serial.print(iamRequestingAllData);
-                Serial.print(", isReceivingDrawingData: ");
-                Serial.print(isReceivingDrawingData);
-                Serial.print(", isSendingDrawingData: ");
-                Serial.print(isSendingDrawingData);
-                Serial.print(", isAwaitingSyncStartResponse: ");
-                Serial.print(isAwaitingSyncStartResponse);
-                Serial.println(")，忽略此点。");
+                // 中间同步状态，忽略
             }
+            break;
+        }
+        case MSG_TYPE_CANVAS_PAGE:
+        {
+            uint8_t action = (uint8_t)msg.touch_data.color;
+            uint8_t page = msg.touch_data.page;
+            uint8_t count = (uint8_t)msg.touch_data.y;
+            if (count == 0)
+                count = (uint8_t)msg.touch_data.x; // 兜底
+            applyRemoteCanvasPage(action, page, count);
+            {
+                const char *who = msg.senderId[0] ? msg.senderId : "Peer";
+                if (action == CANVAS_PAGE_ACT_CREATE)
+                    setActivityStatus(who, "新建页");
+                else if (action == CANVAS_PAGE_ACT_DELETE)
+                    setActivityStatus(who, "删页");
+                else if (action == CANVAS_PAGE_ACT_CLEAR)
+                    setActivityStatus(who, "清页");
+                else if (action == CANVAS_PAGE_ACT_INFO)
+                    setActivityStatus(who, "翻页");
+            }
+            if (!isScreenOn)
+                hasNewUpdateWhileScreenOff = true;
             break;
         }
         case MSG_TYPE_REQUEST_ALL_DRAWINGS:
@@ -475,6 +669,7 @@ void processIncomingMessages()
                 }
                 isSendingDrawingData = true;
                 currentHistorySendIndex = 0;
+                showStatusToast("正在广播笔迹…");
                 // 原有的 for 循环发送逻辑已移除
             }
             else
@@ -521,16 +716,23 @@ void processIncomingMessages()
                 timeRequestSentForAllDrawings = 0;
                 uptimeOfLastPeerSyncedFrom = peerRawUptime;
 
-                hideReceiveProgress(); // 在所有状态更新后，显式隐藏接收进度条
+                hideReceiveProgress();
 
                 Serial.print("  relativeBootTimeOffset 计算并设置为: ");
                 Serial.println(relativeBootTimeOffset);
-                Serial.print("  uptimeOfLastPeerSyncedFrom 设置为: ");
-                Serial.println(uptimeOfLastPeerSyncedFrom);
                 lastKnownPeerUptime = peerRawUptime;
                 lastKnownPeerOffset = peerReceivedOffset;
 
-                Serial.println("  处理 UPTIME_INFO 进行同步决策。");
+                markPeerCanvasSynced(macKeyFromLastPeer());
+                refreshCanvasPageCountFromHistory();
+                if (shouldSkipCanvasPaint()) {
+                    pendingCanvasRedrawAfterChat = true;
+                } else {
+                    historyRestoredNotify(msg.senderId[0] ? msg.senderId : nullptr);
+                    paintCurrentCanvasPage();
+                }
+
+                Serial.println("  同步完成。");
                 Serial.print("  本地有效运行时间: ");
                 Serial.print(millis() + relativeBootTimeOffset);
                 Serial.print(" (原始: ");
@@ -588,6 +790,15 @@ void processIncomingMessages()
         case MSG_TYPE_CLEAR_AND_REQUEST_UPDATE:
         {
             Serial.println("收到 MSG_TYPE_CLEAR_AND_REQUEST_UPDATE.");
+            String peerKeyClear = macKeyFromLastPeer();
+            // 已与该对端同步过：忽略重复 CLEAR，杜绝无故 restore
+            if (!peerNeedsCanvasSync(peerKeyClear)) {
+                Serial.println("  忽略：该对端已同步/冷却中。");
+                lastKnownPeerUptime = peerRawUptime;
+                lastKnownPeerOffset = peerReceivedOffset;
+                initialSyncLogicProcessed = true;
+                break;
+            }
             unsigned long effectiveUptimeDifference = (localEffectiveUptime > peerEffectiveUptime) ? (localEffectiveUptime - peerEffectiveUptime) : (peerEffectiveUptime - localEffectiveUptime);
 
             if (localEffectiveUptime < peerEffectiveUptime && effectiveUptimeDifference > EFFECTIVE_UPTIME_SYNC_THRESHOLD)
@@ -628,6 +839,7 @@ void processIncomingMessages()
             else
             {
                 Serial.println("  决策: 收到 CLEAR_AND_REQUEST_UPDATE，但本机有效运行时间并非较短 (或在阈值内)。忽略。");
+                markPeerCanvasSynced(peerKeyClear);
                 if (peerRawUptime != 0)
                     lastKnownPeerUptime = peerRawUptime;
                 if (peerReceivedOffset != 0 || lastKnownPeerOffset != 0)
@@ -640,24 +852,28 @@ void processIncomingMessages()
         {
             Serial.println("收到 MSG_TYPE_RESET_CANVAS.");
             allDrawingHistory.clear();
-            clearScreenAndCache();
+            if (shouldSkipCanvasPaint())
+                pendingCanvasRedrawAfterChat = true;
+            else
+                clearScreenAndCache();
             relativeBootTimeOffset = 0;
             iamEffectivelyMoreUptimeDevice = false;
             iamRequestingAllData = false;
             isAwaitingSyncStartResponse = false;
             isReceivingDrawingData = false;
             isSendingDrawingData = false;
-            initialSyncLogicProcessed = false;
+            initialSyncLogicProcessed = true;
             lastKnownPeerUptime = 0;
             lastKnownPeerOffset = 0;
             uptimeOfLastPeerSyncedFrom = 0;
+            canvasSyncedPeers.clear();
+            lastCanvasSyncMs.clear();
             SyncMessage_t uptimeInfoMsg;
             uptimeInfoMsg.type = MSG_TYPE_UPTIME_INFO;
             uptimeInfoMsg.senderUptime = localCurrentRawUptime;
             uptimeInfoMsg.senderOffset = relativeBootTimeOffset;
             memset(&uptimeInfoMsg.touch_data, 0, sizeof(TouchData_t));
             sendSyncMessage(&uptimeInfoMsg);
-            Serial.println("  画布已重置。发送了新的 UPTIME_INFO。");
             if (!isScreenOn)
                 hasNewUpdateWhileScreenOff = true;
             break;
@@ -669,24 +885,31 @@ void processIncomingMessages()
             {
                 Serial.println("  本机作为请求方，收到响应方的 SYNC_START。准备清空并接收数据。");
                 allDrawingHistory.clear();
-                clearScreenAndCache();
+                if (shouldSkipCanvasPaint()) {
+                    pendingCanvasRedrawAfterChat = true;
+                } else {
+                    clearScreenAndCache();
+                }
                 lastRemotePoint.x = 0;
                 lastRemotePoint.y = 0;
                 lastRemotePoint.z = 0;
                 lastRemoteDrawTime = 0;
+                lastRemoteColor = 0;
+                lastRemotePage = 0;
 
                 isAwaitingSyncStartResponse = false;
                 isReceivingDrawingData = true;
 
                 totalPointsExpectedFromPeer = msg.totalPointsForSync;
                 receivedHistoryPointCount = 0;
-                if (totalPointsExpectedFromPeer > 0)
-                {
-                    updateReceiveProgress(receivedHistoryPointCount, totalPointsExpectedFromPeer);
-                }
-                else
-                {
-                    hideReceiveProgress(); // 如果对方没有点要发送，则隐藏进度条
+                if (!shouldSkipCanvasPaint()) {
+                    char buf[40];
+                    snprintf(buf, sizeof(buf), "同步自 %s…", msg.senderId[0] ? msg.senderId : "对端");
+                    showStatusToast(buf, 4000);
+                    if (totalPointsExpectedFromPeer > 0)
+                        updateReceiveProgress(receivedHistoryPointCount, totalPointsExpectedFromPeer);
+                    else
+                        hideReceiveProgress();
                 }
 
                 lastKnownPeerUptime = peerRawUptime;
@@ -827,19 +1050,23 @@ void checkPeerHeartbeatTimeout()
             Serial.print(mac);
             Serial.println(" 心跳超时，认为已下线。");
             macsToRemove.push_back(mac);
-            // TODO: 在 UI 或其他地方显示对端下线的信息
-            // 例如：updatePeerStatus(mac, false);
         }
     }
 
     // 移除超时的对端
     for (const auto& mac : macsToRemove)
     {
+        const char *leaveId = mac.c_str();
+        auto it = peerInfoMap.find(mac);
+        if (it != peerInfoMap.end() && it->second.deviceId[0])
+            leaveId = it->second.deviceId;
+        peerLeftNotify(leaveId);
+
         peerLastHeartbeat.erase(mac);
-        macSet.erase(mac); // 同时从 macSet 中移除
-        peerInfoMap.erase(mac); // 新增：从对端信息 map 中移除
-        // TODO: 如果需要，更新 UI 显示的对端数量
-        // 例如：updatePeerCountDisplay(macSet.size());
+        macSet.erase(mac);
+        peerInfoMap.erase(mac);
+        // 保留 canvasSyncedPeers / lastCanvasSyncMs：短暂掉线后再上线不得再次全量 restore
+        updateConnectedDevicesCount();
     }
 }
 
@@ -858,47 +1085,152 @@ std::vector<PeerInfo_t> getPeerInfoList() {
     return peerList;
 }
 
+void sendChatEx(MessageType_t type, uint8_t mode, const char *targetId, const char *text, uint16_t color)
+{
+    ChatPacket_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type = type;
+    pkt.mode = mode;
+    pkt.textColor = color ? color : TFT_WHITE;
+    strncpy(pkt.senderId, localDeviceId, DEVICE_ID_MAX_LEN);
+    pkt.senderId[DEVICE_ID_MAX_LEN] = '\0';
+    if (targetId) {
+        strncpy(pkt.targetId, targetId, DEVICE_ID_MAX_LEN);
+        pkt.targetId[DEVICE_ID_MAX_LEN] = '\0';
+    }
+    if (text) {
+        strncpy(pkt.text, text, CHAT_TEXT_MAX);
+        pkt.text[CHAT_TEXT_MAX] = '\0';
+    }
+    pkt.timestamp = millis();
+
+    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&pkt, sizeof(pkt));
+    if (result != ESP_OK) {
+        Serial.print("发送聊天包失败: ");
+        Serial.println(esp_err_to_name(result));
+    }
+}
+
+void sendChatPacket(MessageType_t type, const char *text)
+{
+    sendChatEx(type, CHAT_MODE_PUBLIC, "", text, TFT_WHITE);
+}
+
+void processIncomingChatPacket(const ChatPacket_t &pkt)
+{
+    if (pkt.type == MSG_TYPE_CHAT_GROUP) {
+        // INVITE：仅目标设备处理；DISBAND：成员同步删除
+        if (strncmp(pkt.text, "INVITE:", 7) == 0) {
+            if (strcmp(pkt.targetId, localDeviceId) != 0)
+                return;
+        }
+        if (strncmp(pkt.text, "DISBAND:", 8) == 0) {
+            char tip[40];
+            snprintf(tip, sizeof(tip), "%s disbanded group", pkt.senderId[0] ? pkt.senderId : "?");
+            if (currentUIState != UI_STATE_CHAT)
+                showStatusToast(tip, 2500);
+        }
+        appendChatMessage(pkt.senderId[0] ? pkt.senderId : "Peer", pkt.targetId,
+                          pkt.text, false, CHAT_MODE_GROUP, TFT_ORANGE);
+        return;
+    }
+    if (pkt.type == MSG_TYPE_CHAT_JOIN) {
+        char tip[40];
+        const char *who = pkt.senderId[0] ? pkt.senderId : (pkt.text[0] ? pkt.text : "?");
+        snprintf(tip, sizeof(tip), "%s joined chat", who);
+        if (currentUIState == UI_STATE_CHAT)
+            showChatJoinToast(tip); // 聊天室内用 cn 字体横幅；英文无方框
+        else
+            showStatusToast(tip, 2500);
+        return;
+    }
+    if (pkt.type == MSG_TYPE_CHAT) {
+        if (pkt.mode == CHAT_MODE_PRIVATE) {
+            if (strcmp(pkt.targetId, localDeviceId) != 0 && strcmp(pkt.senderId, localDeviceId) != 0) {
+                return;
+            }
+        }
+        if (pkt.mode == CHAT_MODE_GROUP && pkt.targetId[0] && !chatHasGroup(pkt.targetId)) {
+            return; // 未加入该群，不可见
+        }
+        appendChatMessage(pkt.senderId[0] ? pkt.senderId : "Peer", pkt.targetId,
+                          pkt.text[0] ? pkt.text : "", false, pkt.mode,
+                          pkt.textColor ? pkt.textColor : TFT_WHITE);
+        if (currentUIState != UI_STATE_CHAT) {
+            char tip[48];
+            snprintf(tip, sizeof(tip), "%s: %.16s", pkt.senderId[0] ? pkt.senderId : "?", pkt.text);
+            showStatusToast(tip, 2200);
+        }
+    }
+}
+
 
 // 重播所有绘图历史 (在屏幕上重新绘制所有点和线)
 void replayAllDrawings()
 {
+    // 笔迹只在花瓣画板重放；其它界面只记 pending，返回后再画
+    if (currentUIState != UI_STATE_MAIN || inCustomColorMode) {
+        pendingCanvasRedrawAfterChat = true;
+        return;
+    }
+
     lastRemotePoint.x = 0;
     lastRemotePoint.y = 0;
     lastRemotePoint.z = 0;
     lastRemoteDrawTime = 0;
+    lastRemoteColor = 0;
+    lastRemotePage = currentCanvasPage;
 
-    for (size_t i = 0; i < allDrawingHistory.size(); ++i)
+    const size_t total = allDrawingHistory.size();
+    // 历史过大时降采样绘制，避免同步恢复卡死白屏
+    const size_t stride = (total > 4000) ? 2 : 1;
+
+    for (size_t i = 0; i < total; i += stride)
     {
         const auto &drawData = allDrawingHistory[i];
         if (drawData.isReset)
         {
+            // 只清画布，不在循环里反复重绘整套 UI（原先此处最卡）
             tft.fillScreen(TFT_BLACK);
-            drawMainInterface();
             lastRemotePoint.x = 0;
             lastRemotePoint.y = 0;
             lastRemotePoint.z = 0;
             lastRemoteDrawTime = drawData.timestamp;
+            lastRemoteColor = 0;
             continue;
         }
+        // 只重放当前页，其它页互不影响
+        if (drawData.page != currentCanvasPage)
+            continue;
         int mapX = drawData.x;
         int mapY = drawData.y;
         if (drawData.color == TFT_BLACK) {
-            // 橡皮擦操作：绘制可变半径的圆形
-            tft.fillCircle(mapX, mapY, eraserRadius, TFT_BLACK);
+            int r = resolveEraserRadius(drawData.brushR);
+            // 降采样时强制用段擦，避免漏点；同色连续才连段
+            if (lastRemotePoint.z != 0 && lastRemoteColor == TFT_BLACK &&
+                (drawData.timestamp - lastRemoteDrawTime <= TOUCH_STROKE_INTERVAL * 2 || stride > 1)) {
+                applyEraserSegment(lastRemotePoint.x, lastRemotePoint.y, mapX, mapY, r);
+            } else {
+                applyEraserDot(mapX, mapY, r);
+            }
         } else {
-            // 普通绘图操作
-            if (drawData.timestamp - lastRemoteDrawTime > TOUCH_STROKE_INTERVAL || lastRemotePoint.z == 0)
-            {
-                tft.drawPixel(mapX, mapY, drawData.color);
-            }
+            int r = resolveBrushRadius(drawData.brushR);
+            if (drawData.timestamp - lastRemoteDrawTime > TOUCH_STROKE_INTERVAL || lastRemotePoint.z == 0 ||
+                lastRemoteColor == TFT_BLACK)
+                applyBrushDot(mapX, mapY, drawData.color, r);
             else
-            {
-                tft.drawLine(lastRemotePoint.x, lastRemotePoint.y, mapX, mapY, drawData.color);
-            }
+                applyBrushSegment(lastRemotePoint.x, lastRemotePoint.y, mapX, mapY, drawData.color, r);
         }
         lastRemotePoint.x = mapX;
         lastRemotePoint.y = mapY;
         lastRemotePoint.z = 1;
         lastRemoteDrawTime = drawData.timestamp;
+        lastRemoteColor = drawData.color;
+
+        // 每 64 点让出 CPU，避免看门狗/触摸无响应
+        if ((i & 63) == 0) {
+            yield();
+        }
     }
+    redrawUiChrome();
 }

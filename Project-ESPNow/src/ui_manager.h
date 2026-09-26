@@ -16,7 +16,9 @@ enum UIState_e {
     UI_STATE_MAIN,         // 主绘图界面
     UI_STATE_COLOR_PICKER, // 颜色选择器界面
     UI_STATE_POPUP,        // 弹窗界面 (例如项目信息或 Coffee)
-    UI_STATE_PEER_INFO     // 对端信息界面
+    UI_STATE_PEER_INFO,    // 对端信息界面
+    UI_STATE_NAME_EDIT,    // 设备标识编辑界面
+    UI_STATE_CHAT          // 局域网群聊界面
 };
 typedef enum UIState_e UIState_t;
 
@@ -29,9 +31,12 @@ extern bool inCustomColorMode;     // 是否处于自定义颜色模式
 extern bool isEraserMode;          // 是否处于橡皮擦模式
 extern bool isEraserSliderVisible; // 是否显示橡皮擦滑块
 extern int eraserRadius;          // 当前橡皮擦半径
+extern int brushRadius;           // 当前画笔半径
+extern bool isBrushSliderVisible; // 是否显示笔粗细滑块
 extern bool isDebugInfoVisible;    // 调试信息框是否可见
 extern bool showDebugToggleButton; // 是否显示调试信息切换按钮
 extern bool isPeerInfoScreenVisible; // 对端信息界面是否可见
+extern char localDeviceId[DEVICE_ID_MAX_LEN + 1]; // 本机短标识
 
 // 进度条状态变量
 extern int sendProgressTotal;      // 发送总数
@@ -70,7 +75,32 @@ void drawEraserSlider();      // 新增：绘制橡皮擦滑块
 void drawPeerInfoButton();    // 显示对端信息按钮 (可能显示连接设备数)
 void drawCustomColorButton(); // 显示当前颜色
 void drawStarButton();        // 显示当前颜色, 自定义颜色入口的占位符
-void drawScreenshotButton();  // 绘制截屏按钮
+void drawScreenshotButton();  // 绘制截屏按钮 (仅 SD 存在时)
+void drawCanvasPageButtons(); // 右下角画布翻页 / 新建 / 清页
+bool isCanvasPagePrevPressed(int x, int y);
+bool isCanvasPageNextPressed(int x, int y);
+bool isCanvasPageClearPressed(int x, int y);
+void handleCanvasPagePrev();  // 上一页；当前页空则删除
+void handleCanvasPageNext();  // 下一页或新建
+void handleCanvasPageClear(); // 仅清空当前页笔迹（广播）
+void showCanvasPage(uint8_t page, bool broadcastInfo);
+void applyRemoteCanvasPage(uint8_t action, uint8_t page, uint8_t pageCount);
+uint8_t getCurrentCanvasPage();
+uint8_t getCanvasPageCount();
+bool canvasPageHasContent(uint8_t page);
+void paintCurrentCanvasPage(); // 清屏并重放当前页笔迹 + UI
+extern uint8_t currentCanvasPage;
+extern uint8_t canvasPageCount;
+void drawSignalStrengthInfo(); // 左侧显示对端信号强度
+void updateSignalStrengthDisplay(); // 轮换刷新信号显示
+void updateOnlinePanelLive(); // 在线列表延迟/信号动态刷新
+bool detectSdCardPresent();    // 检测是否插入 SD 卡（轻量，勿在画屏前阻塞调用）
+bool isSdCardAvailable();      // 当前是否可用 SD
+void deferSdCardDetection();   // 标记：稍后在 loop 里探测 SD
+void processDeferredSdDetect(); // loop 中调用的非阻塞调度
+extern bool sdCardAvailable;   // SD 卡可用标志
+extern bool sdDetectPending;   // 是否还有待完成的 SD 探测
+extern bool pendingCanvasRedrawAfterChat; // 非花瓣画板时延后笔迹重绘
 
 // 调试信息函数
 void drawDebugInfo();         // 显示历史记录大小、运行时间、偏移量、内存
@@ -82,8 +112,20 @@ void hideProjectInfoPopup();  // 隐藏项目信息弹窗
 
 // "Coffee" 按钮相关函数
 void drawCoffeeButton();      // 绘制 "Coffee" 按钮
+void drawChatJoinButton();    // 绘制加入聊天室按钮
 void showCoffeePopup();       // 显示 "Coffee" 弹窗
 void hideCoffeePopup();       // 隐藏 "Coffee" 弹窗
+void showChatRoom();          // 进入群聊
+void hideChatRoom();          // 退出群聊回主界面
+void showChatJoinToast(const char *msg); // 聊天室内短暂加入提示
+void chatTouchReleased();     // 抬手时复位滑动状态
+void nameEditTouchReleased(); // 抬手时复位 ID 编辑按键
+void drawChatRoom();          // 绘制群聊界面
+bool handleChatTouch(int x, int y); // 群聊触摸
+void appendChatMessage(const char *senderId, const char *targetId, const char *text,
+                       bool isSelf, uint8_t mode, uint16_t color);
+bool chatHasGroup(const char *gid); // 本机是否已加入该群
+bool isChatJoinButtonPressed(int x, int y);
 
 // 对端信息界面函数
 void drawPeerInfoScreen();
@@ -97,6 +139,8 @@ bool isResetButtonPressed(int x, int y);
 bool isColorButtonPressed(int x, int y, uint32_t &selectedColor); // 输出选中的颜色
 bool isEraserButtonPressed(int x, int y); // 新增：检测橡皮擦按钮是否被按下
 bool isEraserSliderPressed(int x, int y); // 新增：检测橡皮擦滑块是否被按下
+bool isBrushButtonPressed(int x, int y);
+bool isBrushSliderPressed(int x, int y);
 bool isPeerInfoButtonPressed(int x, int y); // 检测对端信息按钮是否被按下
 bool isPeerInfoScreenBackButtonPressed(int x, int y); // 检测对端信息界面返回按钮是否被按下 - 新增声明
 bool isCustomColorButtonPressed(int x, int y); // 用于进入自定义颜色模式
@@ -109,6 +153,10 @@ bool isScreenshotButtonPressed(int x, int y); // 检测截屏按钮是否被按�
 // 自定义颜色选择器 UI 函数
 void handleCustomColorTouch(int x, int y); // 处理颜色选择器内的触摸
 void handleEraserSliderTouch(int x, int y); // 新增：处理橡皮擦滑块触摸
+void handleBrushSliderTouch(int x, int y);
+void drawBrushButton();
+void drawBrushSlider();
+void redrawBrushButton();
 void updateSingleColorSlider(int yPos, uint32_t sliderColor, int &channelValue);
 void drawColorSelectors();       // 绘制 RGB 滑块和返回按钮
 void updateCustomColorPreview(); // 更新颜色预览框
@@ -144,6 +192,33 @@ void redrawEraserButton(); // 新增：重绘橡皮擦按钮
 void initScreenshotCounter(); // 初始化截屏计数器
 bool saveScreenshotToSD(); // 保存截屏到SD卡
 void showScreenshotError(const char* errorMsg); // 显示截屏错误消息
+
+// 设备标识 / 状态提示
+void loadLocalDeviceId();
+void saveLocalDeviceId(const char *id);
+bool isDeviceIdTakenByNearbyPeer(const char *id); // 附近是否已有相同 ID
+const char *getLocalDeviceId();
+void showStatusToast(const char *msg, unsigned long durationMs = STATUS_TOAST_MS);
+void setDrawingStatus(const char *deviceId); // 兼容：等同 setActivityStatus(id,"drawing")
+void setActivityStatus(const char *deviceId, const char *action); // 谁在干什么
+void clearDrawingStatus();
+void updateStatusOverlays(); // loop 中周期性调用
+void redrawUiChrome();       // 仅重绘操作按钮，不擦画布
+bool eraserOverlapsUi(int cx, int cy, int r);
+bool safeEraserFill(int cx, int cy, int r); // 兼容：擦除后若碰 UI 返回 false
+bool applyEraserDot(int cx, int cy, int r); // 擦一点，碰 UI 返回 true
+bool applyEraserSegment(int x0, int y0, int x1, int y1, int r); // 沿路径擦
+void applyBrushDot(int cx, int cy, uint32_t color, int r);
+void applyBrushSegment(int x0, int y0, int x1, int y1, uint32_t color, int r);
+int resolveEraserRadius(uint8_t brushR);
+int resolveBrushRadius(uint8_t brushR);
+void showNameEditScreen();
+void hideNameEditScreen();
+void drawNameEditScreen();
+bool handleNameEditTouch(int x, int y); // true=已处理
+void peerJoinedNotify(const char *idOrMac);
+void peerLeftNotify(const char *idOrMac);
+void historyRestoredNotify(const char *fromId);
 
 // 可能需要从其他模块获取的函数
 extern float readBatteryVoltagePercentage(); // drawResetButton 使用，已移至 power_manager

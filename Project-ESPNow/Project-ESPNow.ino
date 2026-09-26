@@ -16,6 +16,11 @@
 // 2025.5.10: 修复了清屏bug,同步bug,并且优化了debug按钮，添加了嵌入式的coffee按钮（已获得Kurio Reiko授权）。
 // 2025.5.17: 支持触摸点超过2048个的情况
 // 2025.5.17: 新增对端信息界面和心跳包逻辑，10s无心跳认为对端下线。
+// 2026.9.26: 设备短标识(ID)、进出线/掉线/恢复字迹提示、画画状态条；修复橡皮擦擦掉操作按钮。
+// 2026.9.26b: 无SD隐藏S；左侧RSSI轮显；ESP-NOW局域网群聊打字(聊按钮)。
+// 2026.9.26c: 修复启动白屏卡顿——SD延迟探测；恢复字迹降负载。
+// 2026.9.26d: 中文显示/拼音输入；私聊/群组管理；聊天文字颜色。
+// 2026.9.26e: 禁加入刷屏；聊天中不叠 restore；修误触发同步；音节级大词库+标点。
 
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
@@ -87,32 +92,37 @@ void setup()
     uiManagerInit();     // 初始化 UI 管理器 (如果需要特定设置)
     touchHandlerInit();  // 初始化触摸处理器 (如果需要特定设置)
 
-    // 2. 初始化硬件接口 (SPI, 触摸屏, TFT)
-    initTouchSPI(); // 初始化SPI为触摸屏配置
+    // 2. 初始化硬件接口 (SPI, 触摸屏, TFT) —— 立刻清屏，避免白屏
+    initTouchSPI();
     tft.init();
-    tft.setRotation(1); // 设置TFT显示方向
+    tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
 
     // 3. 初始化 WiFi 和 ESP-NOW
     WiFi.mode(WIFI_STA);
-    WiFi.disconnect();   // 断开之前的连接，确保ESP-NOW在干净的状态下初始化
-    espNowInit();        // 初始化 ESP-NOW (来自 esp_now_handler.cpp)
+    WiFi.disconnect();
+    loadLocalDeviceId();
+    espNowInit();
 
-    // 4. 记录启动时间 (调试用)
+    // 4. 记录启动时间
     deviceInitialBootMillis = millis();
     Serial.print("设备初始启动毫秒数: ");
     Serial.println(deviceInitialBootMillis);
 
-    // 5. 初始 UPTIME_INFO 广播 (在所有核心服务初始化后)
-    SyncMessage_t initialUptimeMsg; // 已重命名以避免与 setup 中的 uptimeMsg 冲突
+    // 5. 先画主界面（SD 探测推迟到 loop，避免 SD.begin 阻塞导致白屏卡顿）
+    sdCardAvailable = false;
+    screenshotCounter = 1;
+    deferSdCardDetection();
+    drawMainInterface();
+
+    // 6. 初始 UPTIME_INFO 广播
+    SyncMessage_t initialUptimeMsg;
     initialUptimeMsg.type = MSG_TYPE_UPTIME_INFO;
     initialUptimeMsg.senderUptime = millis();
-    initialUptimeMsg.senderOffset = relativeBootTimeOffset; // 来自 esp_now_handler 的 extern 变量
+    initialUptimeMsg.senderOffset = relativeBootTimeOffset;
     memset(&initialUptimeMsg.touch_data, 0, sizeof(TouchData_t));
-    sendSyncMessage(&initialUptimeMsg); // 来自 esp_now_handler.cpp
-    lastUptimeInfoBroadcastTime = millis(); // 更新上次广播时间
-
-    // 6. 绘制初始界面
-    drawMainInterface(); // 来自 ui_manager.cpp
+    sendSyncMessage(&initialUptimeMsg);
+    lastUptimeInfoBroadcastTime = millis();
 }
 
 // updateBreathLED, readBatteryVoltagePercentage 已移至 power_manager.cpp
@@ -125,12 +135,14 @@ void loop()
     handleLocalTouch();         // from touch_handler.cpp
     processIncomingMessages();  // from esp_now_handler.cpp
     handleBootButton();         // from power_manager.cpp
+    processDeferredSdDetect();  // 启动后延迟轻量探测 SD，不堵第一帧
 
     unsigned long currentTimeForLoop = millis();
 
     // 定期任务
-    // 1. 广播 UPTIME_INFO
-    if (currentTimeForLoop - lastUptimeInfoBroadcastTime >= UPTIME_INFO_BROADCAST_INTERVAL) {
+    // 1. 广播 UPTIME_INFO（聊天室内跳过，减负）
+    if (currentUIState != UI_STATE_CHAT &&
+        currentTimeForLoop - lastUptimeInfoBroadcastTime >= UPTIME_INFO_BROADCAST_INTERVAL) {
         SyncMessage_t uptimeMsgLoop; // 已重命名以避免与 setup 中的 uptimeMsg 冲突
         uptimeMsgLoop.type = MSG_TYPE_UPTIME_INFO;
         uptimeMsgLoop.senderUptime = currentTimeForLoop;
@@ -158,8 +170,11 @@ void loop()
 
     // 4. 更新调试信息 (如果屏幕亮且不在调色模式)
     // isScreenOn 和 inCustomColorMode 分别是来自 power_manager 和 ui_manager 的 extern 变量
-    if (isScreenOn && !inCustomColorMode && (currentTimeForLoop - lastDebugInfoUpdateTime >= DEBUG_INFO_UPDATE_INTERVAL)) {
+    if (isScreenOn && !inCustomColorMode && currentUIState == UI_STATE_MAIN &&
+        (currentTimeForLoop - lastDebugInfoUpdateTime >= DEBUG_INFO_UPDATE_INTERVAL)) {
         drawDebugInfo(); // 来自 ui_manager.cpp
+        updateStatusOverlays(); // 状态条 / toast / drawing
+        updateSignalStrengthDisplay(); // 左侧对端信号（多台每5秒轮换）
         lastDebugInfoUpdateTime = currentTimeForLoop;
     }
 
@@ -182,6 +197,14 @@ void loop()
     if (currentUIState == UI_STATE_PEER_INFO && isPeerInfoScreenVisible && (currentTimeForLoop - lastPeerInfoUpdateTime >= PEER_INFO_UPDATE_INTERVAL)) {
         updatePeerInfoScreen(); // 来自 ui_manager.cpp
         lastPeerInfoUpdateTime = currentTimeForLoop;
+    }
+
+    // 8. 在线列表：延迟 / 信号条动态刷新
+    static unsigned long lastOnlinePanelRefresh = 0;
+    if (currentUIState == UI_STATE_CHAT &&
+        (currentTimeForLoop - lastOnlinePanelRefresh >= ONLINE_PANEL_REFRESH_MS)) {
+        updateOnlinePanelLive();
+        lastOnlinePanelRefresh = currentTimeForLoop;
     }
 
     // 短暂延时，避免过于频繁的循环，给其他任务（如WiFi栈）一些时间
