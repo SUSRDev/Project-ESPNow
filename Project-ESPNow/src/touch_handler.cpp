@@ -510,11 +510,13 @@ void handleLocalTouch() {
                                 (currentRawUptime - lastLocalTouchTime <= TOUCH_STROKE_INTERVAL)) {
                                 erased = eraseOwnerInkSegment(lastLocalPoint.x, lastLocalPoint.y,
                                                               mapX, mapY, r, currentCanvasPage, myHash);
+                                // 即时黑圆反馈，避免整屏重绘闪频；抬手再精确重绘
+                                applyEraserSegment(lastLocalPoint.x, lastLocalPoint.y, mapX, mapY, r);
                             } else {
                                 erased = eraseOwnerInkNear(mapX, mapY, r, currentCanvasPage, myHash);
+                                applyEraserDot(mapX, mapY, r);
                             }
-                            if (erased)
-                                paintCanvasAfterOwnerErase();
+                            (void)erased;
                             setActivityStatus(getLocalDeviceId(), "在擦");
                         } else {
                             int r = brushRadius;

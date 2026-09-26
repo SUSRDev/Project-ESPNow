@@ -1545,8 +1545,14 @@ void processIncomingMessages()
                             erased = eraseOwnerInkNear(mapX, mapY, r, currentPointData.page, oh);
                         }
                         // 历史里仍保留橡皮事件；实心点已删
+                        // 即时黑圆，少做整屏重绘防闪
+                        if (strokeContinue && lastRemoteColor == TFT_BLACK &&
+                            (currentPointData.timestamp - lastRemoteDrawTime <= TOUCH_STROKE_INTERVAL))
+                            applyEraserSegment(lastRemotePoint.x, lastRemotePoint.y, mapX, mapY, r);
+                        else
+                            applyEraserDot(mapX, mapY, r);
                         if (erased)
-                            paintCanvasAfterOwnerErase();
+                            paintCanvasAfterOwnerErase(); // 内部已强节流
                     } else {
                         int r = resolveBrushRadius(currentPointData.brushR);
                         if (!strokeContinue ||

@@ -34,7 +34,7 @@ bool inCustomColorMode = false;
 bool isEraserMode = false; // 橡皮擦模式，默认关闭
 bool isEraserSliderVisible = false; // 橡皮擦滑块是否可见
 int eraserRadius = 8; // 当前橡皮擦半径，默认为8
-int brushRadius = 2; // 画笔半径，默认 2
+int brushRadius = 1; // 画笔半径，默认 1
 bool isBrushSliderVisible = false; // 笔粗细滑块是否可见
 bool isDebugInfoVisible = false;   // 调试信息框默认关闭
 bool showDebugToggleButton = true; // 调试信息切换按钮默认显示
@@ -3101,8 +3101,9 @@ static unsigned long lastOwnerErasePaintMs = 0;
 
 void paintCanvasAfterOwnerErase()
 {
+    // 擦除过程中禁止高频整屏重绘（会闪屏）；仅节流偶尔修正被黑圆盖住的他人笔迹
     unsigned long now = millis();
-    if (now - lastOwnerErasePaintMs < 45UL)
+    if (now - lastOwnerErasePaintMs < 280UL)
         return;
     lastOwnerErasePaintMs = now;
     if (currentUIState == UI_STATE_MAIN && !inCustomColorMode)
@@ -3114,7 +3115,10 @@ void paintCanvasAfterOwnerErase()
 void forcePaintCanvasAfterOwnerErase()
 {
     lastOwnerErasePaintMs = 0;
-    paintCanvasAfterOwnerErase();
+    if (currentUIState == UI_STATE_MAIN && !inCustomColorMode)
+        paintCurrentCanvasPage();
+    else
+        pendingCanvasRedrawAfterChat = true;
 }
 
 bool safeEraserFill(int cx, int cy, int r)
