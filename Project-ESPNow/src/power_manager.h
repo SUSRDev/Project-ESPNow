@@ -37,4 +37,13 @@ void manageScreenStateLEDs();
 // 切换屏幕状态 (亮/灭) - 辅助函数，可能被 handleBootButton 调用
 void toggleScreen();
 
+// 记录用户操作（触摸/按键），用于自动息屏计时
+void noteUserActivity();
+
+// 循环中检查：超时无操作则息屏
+void checkAutoScreenOff();
+
+// 强制开/关背光（不翻转）
+void setScreenPower(bool on);
+
 #endif // POWER_MANAGER_H

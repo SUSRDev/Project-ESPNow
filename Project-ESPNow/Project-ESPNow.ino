@@ -27,6 +27,8 @@
 // 2026.9.26c: 修复启动白屏卡顿——SD延迟探测；恢复字迹降负载。
 // 2026.9.26d: 中文显示/拼音输入；私聊/群组管理；聊天文字颜色。
 // 2026.9.26e: 禁加入刷屏；聊天中不叠 restore；修误触发同步；音节级大词库+标点。
+// 2026.9.26f: 信号差→恢复后自动全量重同步画面，补齐断续笔迹。
+// 2026.9.26g: 顶部通知更扁；5分钟无操作自动息屏，触摸唤醒。
 
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
@@ -141,6 +143,7 @@ void loop()
     handleLocalTouch();         // from touch_handler.cpp
     processIncomingMessages();  // from esp_now_handler.cpp
     handleBootButton();         // from power_manager.cpp
+    checkAutoScreenOff();       // 5 分钟无操作自动息屏
     processDeferredSdDetect();  // 启动后延迟轻量探测 SD，不堵第一帧
 
     unsigned long currentTimeForLoop = millis();
@@ -157,6 +160,10 @@ void loop()
         // 新增：填充内存信息
         uptimeMsgLoop.usedMemory = esp_get_free_heap_size();
         uptimeMsgLoop.totalMemory = ESP.getHeapSize();
+        {
+            size_t pts = allDrawingHistory.size();
+            uptimeMsgLoop.totalPointsForSync = (pts > 65535) ? 65535 : (uint16_t)pts;
+        }
         sendSyncMessage(&uptimeMsgLoop); // 来自 esp_now_handler.cpp
         lastUptimeInfoBroadcastTime = currentTimeForLoop;
     }
@@ -173,6 +180,8 @@ void loop()
 
     // 3. 检查对端心跳超时
     checkPeerHeartbeatTimeout(); // 来自 esp_now_handler.cpp
+    // 3b. 信号差→恢复后补一次画面全量同步
+    processPendingSignalRecoveryResync();
 
     // 4. 更新调试信息 (如果屏幕亮且不在调色模式)
     // isScreenOn 和 inCustomColorMode 分别是来自 power_manager 和 ui_manager 的 extern 变量

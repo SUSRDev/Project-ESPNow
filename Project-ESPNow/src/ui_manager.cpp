@@ -34,6 +34,8 @@ bool isDebugInfoVisible = false;   // 调试信息框默认关闭
 bool showDebugToggleButton = true; // 调试信息切换按钮默认显示
 bool isProjectInfoPopupVisible = false; // 项目信息弹窗默认关闭
 bool isCoffeePopupVisible = false;    // "Coffee" 弹窗默认关闭
+bool isClearConfirmVisible = false;   // 清空确认弹窗
+ClearConfirmKind_t clearConfirmKind = CLEAR_CONFIRM_NONE;
 bool isPeerInfoScreenVisible = false; // 对端信息界面默认关闭
 int screenshotCounter = 1; // 截屏文件计数器
 char localDeviceId[DEVICE_ID_MAX_LEN + 1] = "ESP";
@@ -109,7 +111,7 @@ void drawMainInterface()
         if (isDebugInfoVisible)
         {
             drawDebugInfo();
-            if (!isProjectInfoPopupVisible && !isCoffeePopupVisible) { // 仅在弹窗未显示时绘制按钮
+            if (!isProjectInfoPopupVisible && !isCoffeePopupVisible && !isClearConfirmVisible) { // 仅在弹窗未显示时绘制按钮
                 drawInfoButton();
             }
         }
@@ -136,6 +138,8 @@ void redrawMainScreen()
             showProjectInfoPopup();
         } else if (isCoffeePopupVisible) { // 如果 Coffee 弹窗之前是可见的，重绘它
             showCoffeePopup();
+        } else if (isClearConfirmVisible) {
+            drawClearConfirmPopup();
         } else {
             replayAllDrawings(); // 否则重绘历史笔迹
         }
@@ -147,8 +151,16 @@ void redrawMainScreen()
         drawNameEditScreen();
     } else if (currentUIState == UI_STATE_CHAT) {
         drawChatRoom();
+    } else if (currentUIState == UI_STATE_POPUP) {
+        drawMainInterface();
+        replayAllDrawings();
+        if (isClearConfirmVisible)
+            drawClearConfirmPopup();
+        else if (isCoffeePopupVisible)
+            showCoffeePopup();
+        else if (isProjectInfoPopupVisible)
+            showProjectInfoPopup();
     }
-    // UI_STATE_POPUP 状态由 show/hide 函数直接处理绘制
 }
 
 void redrawMainScreenWithoutMessage()
@@ -1113,10 +1125,137 @@ void hideCoffeePopup() {
     }
 }
 
+void drawClearConfirmPopup()
+{
+    if (!isClearConfirmVisible)
+        return;
+
+    tft.fillRect(CONFIRM_POPUP_X, CONFIRM_POPUP_Y, CONFIRM_POPUP_W, CONFIRM_POPUP_H,
+                 tft.color565(36, 40, 48));
+    tft.drawRect(CONFIRM_POPUP_X, CONFIRM_POPUP_Y, CONFIRM_POPUP_W, CONFIRM_POPUP_H, TFT_WHITE);
+    tft.drawRect(CONFIRM_POPUP_X + 1, CONFIRM_POPUP_Y + 1, CONFIRM_POPUP_W - 2, CONFIRM_POPUP_H - 2,
+                 tft.color565(90, 100, 120));
+
+    const char *title = (clearConfirmKind == CLEAR_CONFIRM_PAGE) ? "清空本页" : "清空全部";
+    const char *hint = (clearConfirmKind == CLEAR_CONFIRM_PAGE)
+                           ? "仅清除当前页笔迹"
+                           : "所有页笔迹都会清除";
+
+    int titleW = cnTextWidth(title);
+    cnDrawUtf8(tft, CONFIRM_POPUP_X + (CONFIRM_POPUP_W - titleW) / 2,
+               CONFIRM_POPUP_Y + 18, title, TFT_WHITE);
+    int hintW = cnTextWidth(hint);
+    cnDrawUtf8(tft, CONFIRM_POPUP_X + (CONFIRM_POPUP_W - hintW) / 2,
+               CONFIRM_POPUP_Y + 44, hint, tft.color565(180, 180, 190));
+
+    // 取消
+    tft.fillRoundRect(CONFIRM_CANCEL_X, CONFIRM_BTN_Y, CONFIRM_BTN_W, CONFIRM_BTN_H, 4,
+                      tft.color565(70, 74, 86));
+    int cancelW = cnTextWidth("取消");
+    cnDrawUtf8(tft, CONFIRM_CANCEL_X + (CONFIRM_BTN_W - cancelW) / 2,
+               CONFIRM_BTN_Y + 6, "取消", TFT_WHITE);
+
+    // 确定
+    tft.fillRoundRect(CONFIRM_OK_X, CONFIRM_BTN_Y, CONFIRM_BTN_W, CONFIRM_BTN_H, 4,
+                      tft.color565(180, 48, 48));
+    int okW = cnTextWidth("确定");
+    cnDrawUtf8(tft, CONFIRM_OK_X + (CONFIRM_BTN_W - okW) / 2,
+               CONFIRM_BTN_Y + 6, "确定", TFT_WHITE);
+}
+
+void showClearConfirm(ClearConfirmKind_t kind)
+{
+    if (!isScreenOn || inCustomColorMode)
+        return;
+    if (kind != CLEAR_CONFIRM_ALL && kind != CLEAR_CONFIRM_PAGE)
+        return;
+    if (isCoffeePopupVisible || isProjectInfoPopupVisible)
+        return;
+
+    clearConfirmKind = kind;
+    isClearConfirmVisible = true;
+    currentUIState = UI_STATE_POPUP;
+    drawClearConfirmPopup();
+}
+
+void hideClearConfirm(bool redraw)
+{
+    if (!isClearConfirmVisible)
+        return;
+    isClearConfirmVisible = false;
+    clearConfirmKind = CLEAR_CONFIRM_NONE;
+    currentUIState = UI_STATE_MAIN;
+    if (redraw)
+        redrawMainScreen();
+}
+
+void performFullCanvasReset()
+{
+    unsigned long now = millis();
+    allDrawingHistory.clear();
+    clearScreenAndCache();
+
+    relativeBootTimeOffset = 0;
+    iamEffectivelyMoreUptimeDevice = false;
+    iamRequestingAllData = false;
+    initialSyncLogicProcessed = false;
+
+    SyncMessage_t resetMsg;
+    memset(&resetMsg, 0, sizeof(resetMsg));
+    resetMsg.type = MSG_TYPE_RESET_CANVAS;
+    resetMsg.senderUptime = now;
+    resetMsg.senderOffset = relativeBootTimeOffset;
+    resetMsg.touch_data.isReset = true;
+    resetMsg.touch_data.timestamp = now;
+    resetMsg.touch_data.color = currentColor;
+    sendSyncMessage(&resetMsg);
+    showStatusToast("已全部清空", 1200);
+}
+
+bool handleClearConfirmTouch(int x, int y)
+{
+    if (!isClearConfirmVisible)
+        return false;
+
+    const bool onCancel =
+        (x >= CONFIRM_CANCEL_X && x <= CONFIRM_CANCEL_X + CONFIRM_BTN_W &&
+         y >= CONFIRM_BTN_Y && y <= CONFIRM_BTN_Y + CONFIRM_BTN_H);
+    const bool onOk =
+        (x >= CONFIRM_OK_X && x <= CONFIRM_OK_X + CONFIRM_BTN_W &&
+         y >= CONFIRM_BTN_Y && y <= CONFIRM_BTN_Y + CONFIRM_BTN_H);
+
+    if (onCancel) {
+        hideClearConfirm(true);
+        return true;
+    }
+
+    if (onOk) {
+        ClearConfirmKind_t kind = clearConfirmKind;
+        hideClearConfirm(false);
+        if (kind == CLEAR_CONFIRM_ALL) {
+            performFullCanvasReset();
+        } else if (kind == CLEAR_CONFIRM_PAGE) {
+            currentUIState = UI_STATE_MAIN;
+            handleCanvasPageClear();
+        } else {
+            redrawMainScreen();
+        }
+        return true;
+    }
+
+    // 点在弹窗外：取消
+    if (x < CONFIRM_POPUP_X || x > CONFIRM_POPUP_X + CONFIRM_POPUP_W ||
+        y < CONFIRM_POPUP_Y || y > CONFIRM_POPUP_Y + CONFIRM_POPUP_H) {
+        hideClearConfirm(true);
+        return true;
+    }
+
+    return true; // 点在弹窗空白处也吞掉，避免画到下面
+}
 
 // --- 新增的项目信息按钮和弹窗函数 ---
 void drawInfoButton() {
-    if (!isScreenOn || inCustomColorMode || !isDebugInfoVisible || isProjectInfoPopupVisible || isCoffeePopupVisible || currentUIState != UI_STATE_MAIN) return; // 如果Coffee弹窗也显示，则不绘制，或不在主界面
+    if (!isScreenOn || inCustomColorMode || !isDebugInfoVisible || isProjectInfoPopupVisible || isCoffeePopupVisible || isClearConfirmVisible || currentUIState != UI_STATE_MAIN) return; // 如果Coffee弹窗也显示，则不绘制，或不在主界面
 
     tft.fillRect(INFO_BUTTON_X, INFO_BUTTON_Y, INFO_BUTTON_W, INFO_BUTTON_H, TFT_DARKGREEN);
     tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
@@ -2505,7 +2644,7 @@ void updateStatusOverlays()
         line[sizeof(line) - 1] = 0;
         color = TFT_CYAN;
     } else {
-        snprintf(line, sizeof(line), "%s|%u人|页%u/%u|笔%d",
+        snprintf(line, sizeof(line), "%s ·%u ·%u/%u ·b%d",
                  localDeviceId,
                  (unsigned)peerInfoMap.size(),
                  (unsigned)(currentCanvasPage + 1),
@@ -2521,7 +2660,7 @@ void updateStatusOverlays()
     int x = STATUS_BAR_X + (STATUS_BAR_W - (tw < STATUS_BAR_W ? tw : STATUS_BAR_W)) / 2;
     if (x < STATUS_BAR_X)
         x = STATUS_BAR_X;
-    cnDrawUtf8Ellipsis(tft, x, STATUS_BAR_Y + 1, line, color, STATUS_BAR_W, TFT_BLACK, false);
+    cnDrawUtf8Ellipsis(tft, x, STATUS_BAR_Y, line, color, STATUS_BAR_W, TFT_BLACK, false);
 }
 
 void peerJoinedNotify(const char *idOrMac)

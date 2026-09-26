@@ -36,6 +36,8 @@ static bool peerInfoLongPressHandled = false;
 // 主界面操作按钮：仅落笔瞬间触发一次
 static bool mainUiFingerDown = false;
 static bool mainUiPressConsumed = false;
+static bool clearConfirmFingerDown = false;
+static bool screenOffTouchDown = false;
 
 // --- 函数实现 ---
 
@@ -157,8 +159,32 @@ void handleLocalTouch() {
     XY_TouchPoint_t xy1;
 
     if (touched) {
+        noteUserActivity();
+
+        // 息屏中：触摸只负责唤醒，本笔不画画/不点按钮
+        if (!isScreenOn) {
+            if (!screenOffTouchDown) {
+                screenOffTouchDown = true;
+                setScreenPower(true);
+            }
+            lastLocalPoint.z = 0;
+            return;
+        }
+
         // 首先处理弹窗关闭逻辑 (Coffee 弹窗优先于项目信息弹窗，如果两者都可能存在)
-        if (isCoffeePopupVisible) {
+        if (isClearConfirmVisible) {
+            xy1 = averageXY();
+            if (!xy1.fly) {
+                if (!clearConfirmFingerDown) {
+                    clearConfirmFingerDown = true;
+                    int mapX = map(xy1.x, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCREEN_WIDTH);
+                    int mapY = map(xy1.y, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCREEN_HEIGHT);
+                    handleClearConfirmTouch(mapX, mapY);
+                }
+                lastLocalPoint.z = 0;
+                return;
+            }
+        } else if (isCoffeePopupVisible) {
             xy1 = averageXY(); // 确认是有效触摸
             if (!xy1.fly) {
                 hideCoffeePopup(); // 关闭 Coffee 弹窗
@@ -245,24 +271,7 @@ void handleLocalTouch() {
                                 resetPressCount = 0;
                             }
 
-                            allDrawingHistory.clear();
-                            clearScreenAndCache();
-
-                            relativeBootTimeOffset = 0;
-                            iamEffectivelyMoreUptimeDevice = false;
-                            iamRequestingAllData = false;
-                            initialSyncLogicProcessed = false;
-
-                            SyncMessage_t resetMsg;
-                            resetMsg.type = MSG_TYPE_RESET_CANVAS;
-                            resetMsg.senderUptime = currentRawUptime;
-                            resetMsg.senderOffset = relativeBootTimeOffset;
-                            resetMsg.touch_data.isReset = true;
-                            resetMsg.touch_data.timestamp = currentRawUptime;
-                            resetMsg.touch_data.x = 0;
-                            resetMsg.touch_data.y = 0;
-                            resetMsg.touch_data.color = currentColor;
-                            sendSyncMessage(&resetMsg);
+                            showClearConfirm(CLEAR_CONFIRM_ALL);
                             return;
                         }
 
@@ -381,7 +390,11 @@ void handleLocalTouch() {
                         if (isCanvasPageClearPressed(mapX, mapY)) {
                             if (mainRising && !mainUiPressConsumed) {
                                 mainUiPressConsumed = true;
-                                handleCanvasPageClear();
+                                if (!canvasPageHasContent(currentCanvasPage)) {
+                                    showStatusToast("本页为空", 1000);
+                                } else {
+                                    showClearConfirm(CLEAR_CONFIRM_PAGE);
+                                }
                             }
                             return;
                         }
@@ -476,6 +489,8 @@ void handleLocalTouch() {
     } else { // 当前未检测到触摸
         mainUiFingerDown = false;
         mainUiPressConsumed = false;
+        clearConfirmFingerDown = false;
+        screenOffTouchDown = false;
         if (currentUIState == UI_STATE_CHAT)
             chatTouchReleased();
         if (currentUIState == UI_STATE_NAME_EDIT)

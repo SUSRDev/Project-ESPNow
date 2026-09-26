@@ -64,6 +64,7 @@ typedef struct PeerInfo_s {
     uint32_t totalMemory;
     char deviceId[DEVICE_ID_MAX_LEN + 1]; // 对端短标识
     int8_t rssi;                          // 最近一次收到该对端包的 RSSI (dBm)
+    uint16_t historyPoints;               // 对端最近通报的笔迹点数（心跳/同步）
 } PeerInfo_t;
 
 
@@ -104,6 +105,7 @@ void processIncomingMessages(); // 处理接收到的消息队列
 void replayAllDrawings();       // 重播所有绘图历史 (需要 tft 对象)
 void sendHeartbeat(); // 新增：发送心跳包
 void checkPeerHeartbeatTimeout(); // 新增：检查对端心跳超时
+void processPendingSignalRecoveryResync(); // 信号恢复后补一次全量画面同步
 std::vector<PeerInfo_t> getPeerInfoList(); // 新增：获取对端信息列表
 void sendChatPacket(MessageType_t type, const char *text); // 兼容：发到大厅
 void sendChatEx(MessageType_t type, uint8_t mode, const char *targetId, const char *text, uint16_t color);

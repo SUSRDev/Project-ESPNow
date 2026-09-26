@@ -28,6 +28,22 @@ static std::set<String> canvasSyncedPeers;
 static std::map<String, unsigned long> lastCanvasSyncMs;
 static std::map<String, unsigned long> peerLastRawUptimeSeen;
 
+// 对端链路质量：差→好时触发一次画面全量重同步
+struct PeerSignalState_t {
+    bool markedBad = false;
+    unsigned long badCandidateSince = 0;
+    unsigned long goodCandidateSince = 0;
+    unsigned long lastRecoveryResyncMs = 0;
+};
+static std::map<String, PeerSignalState_t> peerSignalState;
+static bool pendingSignalRecoveryResync = false;
+static String pendingSignalRecoveryPeer;
+static unsigned long pendingSignalRecoveryPeerUptime = 0;
+static long pendingSignalRecoveryPeerOffset = 0;
+static unsigned long signalRecoveryFallbackAtMs = 0;
+static String signalRecoveryFallbackPeer;
+static bool signalRecoveryAllowLargerMac = false;
+
 static String macKeyFromLastPeer()
 {
     char macStr[18];
@@ -35,6 +51,40 @@ static String macKeyFromLastPeer()
              lastPeerMac[0], lastPeerMac[1], lastPeerMac[2],
              lastPeerMac[3], lastPeerMac[4], lastPeerMac[5]);
     return String(macStr);
+}
+
+static bool localIsSyncSourceVsMac(unsigned long localEff, unsigned long peerEff,
+                                   const uint8_t peerMac[6])
+{
+    if (localEff > peerEff)
+        return true;
+    if (localEff < peerEff)
+        return false;
+    uint8_t myMac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, myMac);
+    return memcmp(myMac, peerMac, 6) > 0;
+}
+
+static bool localIsSyncSource(unsigned long localEff, unsigned long peerEff)
+{
+    return localIsSyncSourceVsMac(localEff, peerEff, lastPeerMac);
+}
+
+static bool parseMacKey(const String &macKey, uint8_t outMac[6])
+{
+    unsigned int b[6] = {0};
+    if (sscanf(macKey.c_str(), "%02X:%02X:%02X:%02X:%02X:%02X",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
+        return false;
+    for (int i = 0; i < 6; i++)
+        outMac[i] = (uint8_t)b[i];
+    return true;
+}
+
+static bool syncBusy()
+{
+    return iamRequestingAllData || isReceivingDrawingData ||
+           isSendingDrawingData || isAwaitingSyncStartResponse;
 }
 
 // 笔迹与 restore 只允许出现在花瓣画板主界面
@@ -165,6 +215,209 @@ static void refreshCanvasPageCountFromHistory()
 }
 // unsigned long touchInterval = 50;     // 触摸笔划间隔阈值 (毫秒) -> 已移至 config.h 作为 TOUCH_STROKE_INTERVAL
 
+static void cancelSignalRecoveryFallback()
+{
+    signalRecoveryFallbackAtMs = 0;
+    signalRecoveryFallbackPeer = "";
+    signalRecoveryAllowLargerMac = false;
+}
+
+static void beginRequestAllDrawings()
+{
+    unsigned long now = millis();
+    iamEffectivelyMoreUptimeDevice = false;
+    iamRequestingAllData = true;
+    isAwaitingSyncStartResponse = true;
+    allDrawingHistory.clear();
+
+    SyncMessage_t syncStartMsg;
+    memset(&syncStartMsg, 0, sizeof(syncStartMsg));
+    syncStartMsg.type = MSG_TYPE_SYNC_START;
+    syncStartMsg.senderUptime = now;
+    syncStartMsg.senderOffset = relativeBootTimeOffset;
+    sendSyncMessage(&syncStartMsg);
+
+    SyncMessage_t requestMsg;
+    memset(&requestMsg, 0, sizeof(requestMsg));
+    requestMsg.type = MSG_TYPE_REQUEST_ALL_DRAWINGS;
+    requestMsg.senderUptime = now;
+    requestMsg.senderOffset = relativeBootTimeOffset;
+    requestMsg.touch_data.x = CANVAS_FORCE_RESYNC_FLAG;
+    sendSyncMessage(&requestMsg);
+    timeRequestSentForAllDrawings = millis();
+}
+
+static void beginPromptPeerToRequest(const String &peerKey, bool force)
+{
+    unsigned long now = millis();
+    iamEffectivelyMoreUptimeDevice = true;
+    iamRequestingAllData = false;
+
+    SyncMessage_t promptMsg;
+    memset(&promptMsg, 0, sizeof(promptMsg));
+    promptMsg.type = MSG_TYPE_CLEAR_AND_REQUEST_UPDATE;
+    promptMsg.senderUptime = now;
+    promptMsg.senderOffset = relativeBootTimeOffset;
+    if (force)
+        promptMsg.touch_data.x = CANVAS_FORCE_RESYNC_FLAG;
+    sendSyncMessage(&promptMsg);
+    markPeerCanvasSynced(peerKey);
+}
+
+static void queueSignalRecoveryResync(const String &peerKey,
+                                     unsigned long peerRawUptime,
+                                     long peerOffset)
+{
+    pendingSignalRecoveryResync = true;
+    pendingSignalRecoveryPeer = peerKey;
+    if (peerRawUptime != 0) {
+        pendingSignalRecoveryPeerUptime = peerRawUptime;
+        pendingSignalRecoveryPeerOffset = peerOffset;
+    } else {
+        auto pit = peerInfoMap.find(peerKey);
+        if (pit != peerInfoMap.end() && pit->second.effectiveUptime != 0) {
+            pendingSignalRecoveryPeerUptime = pit->second.effectiveUptime;
+            pendingSignalRecoveryPeerOffset = 0;
+        } else {
+            pendingSignalRecoveryPeerUptime = lastKnownPeerUptime;
+            pendingSignalRecoveryPeerOffset = lastKnownPeerOffset;
+        }
+    }
+}
+
+static void updatePeerSignalQuality(const String &peerKey, int8_t rssi,
+                                    unsigned long peerRawUptime, long peerOffset)
+{
+    if (rssi == 0 || peerKey.length() == 0)
+        return;
+
+    PeerSignalState_t &st = peerSignalState[peerKey];
+    unsigned long now = millis();
+
+    if (rssi <= SIGNAL_BAD_RSSI_DBM) {
+        st.goodCandidateSince = 0;
+        if (st.badCandidateSince == 0)
+            st.badCandidateSince = now;
+        else if (!st.markedBad && (now - st.badCandidateSince) >= SIGNAL_BAD_HOLD_MS) {
+            st.markedBad = true;
+            Serial.print("对端信号变差: ");
+            Serial.print(peerKey);
+            Serial.print(" RSSI=");
+            Serial.println((int)rssi);
+        }
+        return;
+    }
+
+    if (rssi >= SIGNAL_GOOD_RSSI_DBM) {
+        st.badCandidateSince = 0;
+        if (!st.markedBad) {
+            st.goodCandidateSince = 0;
+            return;
+        }
+        if (st.goodCandidateSince == 0)
+            st.goodCandidateSince = now;
+        else if ((now - st.goodCandidateSince) >= SIGNAL_GOOD_HOLD_MS) {
+            st.markedBad = false;
+            st.goodCandidateSince = 0;
+            if (st.lastRecoveryResyncMs != 0 &&
+                (now - st.lastRecoveryResyncMs) < SIGNAL_RECOVERY_RESYNC_COOLDOWN_MS) {
+                Serial.println("信号已恢复，但重同步仍在冷却中");
+                return;
+            }
+            st.lastRecoveryResyncMs = now;
+            Serial.print("对端信号恢复，排队画面重同步: ");
+            Serial.println(peerKey);
+            queueSignalRecoveryResync(peerKey, peerRawUptime, peerOffset);
+        }
+        return;
+    }
+
+    // 中间区：不推进计时，避免临界来回抖动
+    st.badCandidateSince = 0;
+    st.goodCandidateSince = 0;
+}
+
+void processPendingSignalRecoveryResync()
+{
+    // 大 MAC 等待对端发起超时后，自己兜底发起
+    if (!pendingSignalRecoveryResync && signalRecoveryFallbackAtMs != 0 &&
+        (long)(millis() - signalRecoveryFallbackAtMs) >= 0) {
+        if (!syncBusy()) {
+            pendingSignalRecoveryResync = true;
+            pendingSignalRecoveryPeer = signalRecoveryFallbackPeer;
+            auto pit = peerInfoMap.find(signalRecoveryFallbackPeer);
+            if (pit != peerInfoMap.end()) {
+                pendingSignalRecoveryPeerUptime = pit->second.effectiveUptime;
+                pendingSignalRecoveryPeerOffset = 0;
+            }
+            signalRecoveryFallbackAtMs = 0;
+            signalRecoveryAllowLargerMac = true;
+            Serial.println("信号恢复兜底：对端未发起，本机启动同步");
+        }
+    }
+
+    if (!pendingSignalRecoveryResync)
+        return;
+    if (syncBusy())
+        return; // 忙则保留 pending，下一轮再试
+
+    const String peerKey = pendingSignalRecoveryPeer;
+    pendingSignalRecoveryResync = false;
+
+    uint8_t peerMac[6];
+    bool haveMac = parseMacKey(peerKey, peerMac);
+    bool iAmLargerMac = false;
+    if (haveMac) {
+        uint8_t myMac[6];
+        esp_wifi_get_mac(WIFI_IF_STA, myMac);
+        iAmLargerMac = (memcmp(myMac, peerMac, 6) > 0);
+    }
+
+    // 仅 MAC 较小方立刻发起；较大方等 4s，避免双边同时 clear
+    if (iAmLargerMac && !signalRecoveryAllowLargerMac) {
+        clearPeerCanvasSyncState(peerKey);
+        if (signalRecoveryFallbackAtMs == 0) {
+            signalRecoveryFallbackAtMs = millis() + 4000UL;
+            signalRecoveryFallbackPeer = peerKey;
+        }
+        Serial.println("信号恢复：本机 MAC 较大，等待对端发起同步");
+        showStatusToast("信号恢复，等待同步…", 2000);
+        return;
+    }
+
+    signalRecoveryAllowLargerMac = false;
+    signalRecoveryFallbackAtMs = 0;
+    signalRecoveryFallbackPeer = "";
+    clearPeerCanvasSyncState(peerKey);
+
+    unsigned long localEff = millis() + relativeBootTimeOffset;
+    unsigned long peerEff = pendingSignalRecoveryPeerUptime + pendingSignalRecoveryPeerOffset;
+
+    bool amSource = haveMac
+        ? localIsSyncSourceVsMac(localEff, peerEff, peerMac)
+        : localIsSyncSource(localEff, peerEff);
+
+    // 优先以笔迹更多的一侧为源，减少信号差期间本机独有笔迹被清空
+    auto pit = peerInfoMap.find(peerKey);
+    if (pit != peerInfoMap.end() && pit->second.historyPoints > 0) {
+        size_t localPts = allDrawingHistory.size();
+        uint16_t peerPts = pit->second.historyPoints;
+        if (localPts > peerPts + 8)
+            amSource = true;
+        else if (peerPts > localPts + 8)
+            amSource = false;
+    }
+
+    showStatusToast("信号恢复，同步画面…", 2800);
+    Serial.print("执行信号恢复画面重同步 vs ");
+    Serial.println(peerKey);
+
+    if (amSource)
+        beginPromptPeerToRequest(peerKey, true);
+    else
+        beginRequestAllDrawings();
+}
+
 // ESP-NOW 初始化函数
 void espNowInit()
 {
@@ -242,8 +495,16 @@ void OnSyncDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData
         peerInfoMap[macKey].effectiveUptime = receivedMsg.senderUptime + receivedMsg.senderOffset;
         peerInfoMap[macKey].usedMemory = receivedMsg.usedMemory;
         peerInfoMap[macKey].totalMemory = receivedMsg.totalMemory;
+        if (receivedMsg.type == MSG_TYPE_HEARTBEAT ||
+            receivedMsg.type == MSG_TYPE_UPTIME_INFO ||
+            receivedMsg.type == MSG_TYPE_SYNC_START ||
+            receivedMsg.type == MSG_TYPE_ALL_DRAWINGS_COMPLETE) {
+            peerInfoMap[macKey].historyPoints = receivedMsg.totalPointsForSync;
+        }
         if (info->rx_ctrl) {
             peerInfoMap[macKey].rssi = info->rx_ctrl->rssi;
+            updatePeerSignalQuality(macKey, info->rx_ctrl->rssi,
+                                    receivedMsg.senderUptime, receivedMsg.senderOffset);
         }
         if (receivedMsg.senderId[0]) {
             strncpy(peerInfoMap[macKey].deviceId, receivedMsg.senderId, DEVICE_ID_MAX_LEN);
@@ -307,6 +568,7 @@ void OnSyncDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData
         peerLastHeartbeat[macKey] = millis();
         if (info->rx_ctrl) {
             peerInfoMap[macKey].rssi = info->rx_ctrl->rssi;
+            updatePeerSignalQuality(macKey, info->rx_ctrl->rssi, 0, 0);
         }
         peerInfoMap[macKey].macAddress = macKey;
         if (chatPkt.senderId[0]) {
@@ -626,61 +888,57 @@ void processIncomingMessages()
         case MSG_TYPE_REQUEST_ALL_DRAWINGS:
         {
             Serial.println("收到 MSG_TYPE_REQUEST_ALL_DRAWINGS.");
-            if (localEffectiveUptime > peerEffectiveUptime) // 本机是较旧设备，应该响应
-            {
-                if (iamRequestingAllData || isReceivingDrawingData || isSendingDrawingData)
-                {
-                    Serial.println("  但本机正在进行其他同步操作，忽略此新的 REQUEST_ALL_DRAWINGS 请求。");
-                    if (peerRawUptime != 0)
-                        lastKnownPeerUptime = peerRawUptime;
-                    if (peerReceivedOffset != 0 || lastKnownPeerOffset != 0)
-                        lastKnownPeerOffset = peerReceivedOffset;
-                    initialSyncLogicProcessed = true;
-                    break;
-                }
-
-                Serial.print("  决策: 本机有效运行时间较长。发送所有 ");
-                Serial.print(allDrawingHistory.size());
-                Serial.println(" 个点。");
-                iamEffectivelyMoreUptimeDevice = true;
-                // isSendingDrawingData = true; // isSendingDrawingData 将在下面设置
-                lastKnownPeerUptime = peerRawUptime;
-                lastKnownPeerOffset = peerReceivedOffset;
-                initialSyncLogicProcessed = true;
-
-                // 发送同步开始信号给请求方，表明本机即将开始发送数据
-                SyncMessage_t syncStartMsgBeforeSending;
-                syncStartMsgBeforeSending.type = MSG_TYPE_SYNC_START;
-                syncStartMsgBeforeSending.senderUptime = localCurrentRawUptime;
-                syncStartMsgBeforeSending.senderOffset = localCurrentOffset;
-                memset(&syncStartMsgBeforeSending.touch_data, 0, sizeof(TouchData_t));
-                syncStartMsgBeforeSending.totalPointsForSync = allDrawingHistory.size(); // 设置总点数
-                sendSyncMessage(&syncStartMsgBeforeSending);
-                Serial.println("  发送 MSG_TYPE_SYNC_START (准备发送历史数据，将开始分批发送)");
-
-                // 设置状态以开始分批发送，实际发送将在 processIncomingMessages 末尾的逻辑中进行
-                if (!allDrawingHistory.empty())
-                {
-                    updateSendProgress(0, allDrawingHistory.size()); // 初始化发送进度条
-                }
-                else
-                {
-                    hideSendProgress(); // 如果没有历史记录，则隐藏进度条
-                }
-                isSendingDrawingData = true;
-                currentHistorySendIndex = 0;
-                showStatusToast("正在广播笔迹…");
-                // 原有的 for 循环发送逻辑已移除
+            const bool forceResync = (msg.touch_data.x == CANVAS_FORCE_RESYNC_FLAG);
+            if (forceResync) {
+                clearPeerCanvasSyncState(macKeyFromLastPeer());
+                cancelSignalRecoveryFallback();
             }
-            else
+            if (!localIsSyncSource(localEffectiveUptime, peerEffectiveUptime))
             {
-                Serial.println("  决策: 收到 REQUEST_ALL_DRAWINGS，但本机有效运行时间并非较长。忽略。");
+                Serial.println("  决策: 收到 REQUEST_ALL_DRAWINGS，但本机并非同步源。忽略。");
                 if (peerRawUptime != 0)
                     lastKnownPeerUptime = peerRawUptime;
                 if (peerReceivedOffset != 0 || lastKnownPeerOffset != 0)
                     lastKnownPeerOffset = peerReceivedOffset;
                 initialSyncLogicProcessed = true;
+                break;
             }
+
+            if (iamRequestingAllData || isReceivingDrawingData || isSendingDrawingData)
+            {
+                Serial.println("  但本机正在进行其他同步操作，忽略此新的 REQUEST_ALL_DRAWINGS 请求。");
+                if (peerRawUptime != 0)
+                    lastKnownPeerUptime = peerRawUptime;
+                if (peerReceivedOffset != 0 || lastKnownPeerOffset != 0)
+                    lastKnownPeerOffset = peerReceivedOffset;
+                initialSyncLogicProcessed = true;
+                break;
+            }
+
+            Serial.print("  决策: 本机作为同步源。发送所有 ");
+            Serial.print(allDrawingHistory.size());
+            Serial.println(" 个点。");
+            iamEffectivelyMoreUptimeDevice = true;
+            lastKnownPeerUptime = peerRawUptime;
+            lastKnownPeerOffset = peerReceivedOffset;
+            initialSyncLogicProcessed = true;
+
+            SyncMessage_t syncStartMsgBeforeSending;
+            syncStartMsgBeforeSending.type = MSG_TYPE_SYNC_START;
+            syncStartMsgBeforeSending.senderUptime = localCurrentRawUptime;
+            syncStartMsgBeforeSending.senderOffset = localCurrentOffset;
+            memset(&syncStartMsgBeforeSending.touch_data, 0, sizeof(TouchData_t));
+            syncStartMsgBeforeSending.totalPointsForSync = allDrawingHistory.size();
+            sendSyncMessage(&syncStartMsgBeforeSending);
+            Serial.println("  发送 MSG_TYPE_SYNC_START (准备发送历史数据，将开始分批发送)");
+
+            if (!allDrawingHistory.empty())
+                updateSendProgress(0, allDrawingHistory.size());
+            else
+                hideSendProgress();
+            isSendingDrawingData = true;
+            currentHistorySendIndex = 0;
+            showStatusToast("正在广播笔迹…");
             break;
         }
         case MSG_TYPE_ALL_DRAWINGS_COMPLETE:
@@ -791,19 +1049,32 @@ void processIncomingMessages()
         {
             Serial.println("收到 MSG_TYPE_CLEAR_AND_REQUEST_UPDATE.");
             String peerKeyClear = macKeyFromLastPeer();
-            // 已与该对端同步过：忽略重复 CLEAR，杜绝无故 restore
-            if (!peerNeedsCanvasSync(peerKeyClear)) {
+            const bool forceResync = (msg.touch_data.x == CANVAS_FORCE_RESYNC_FLAG);
+            if (forceResync) {
+                clearPeerCanvasSyncState(peerKeyClear);
+                cancelSignalRecoveryFallback();
+                Serial.println("  强制重同步（信号恢复）。");
+            } else if (!peerNeedsCanvasSync(peerKeyClear)) {
+                // 已与该对端同步过：忽略重复 CLEAR，杜绝无故 restore
                 Serial.println("  忽略：该对端已同步/冷却中。");
                 lastKnownPeerUptime = peerRawUptime;
                 lastKnownPeerOffset = peerReceivedOffset;
                 initialSyncLogicProcessed = true;
                 break;
             }
-            unsigned long effectiveUptimeDifference = (localEffectiveUptime > peerEffectiveUptime) ? (localEffectiveUptime - peerEffectiveUptime) : (peerEffectiveUptime - localEffectiveUptime);
 
-            if (localEffectiveUptime < peerEffectiveUptime && effectiveUptimeDifference > EFFECTIVE_UPTIME_SYNC_THRESHOLD)
+            unsigned long effectiveUptimeDifference =
+                (localEffectiveUptime > peerEffectiveUptime)
+                    ? (localEffectiveUptime - peerEffectiveUptime)
+                    : (peerEffectiveUptime - localEffectiveUptime);
+            const bool shouldRequest = forceResync
+                ? !localIsSyncSource(localEffectiveUptime, peerEffectiveUptime)
+                : (localEffectiveUptime < peerEffectiveUptime &&
+                   effectiveUptimeDifference > EFFECTIVE_UPTIME_SYNC_THRESHOLD);
+
+            if (shouldRequest)
             {
-                Serial.println("  决策: 本机有效运行时间较短 (超出阈值)。执行清空并请求。");
+                Serial.println("  决策: 本机向对端请求全量笔迹。");
                 if (iamRequestingAllData || isReceivingDrawingData || isSendingDrawingData)
                 {
                     Serial.println("  但当前已有同步正在进行，忽略新的 CLEAR_AND_REQUEST_UPDATE 触发的同步请求。");
@@ -812,33 +1083,14 @@ void processIncomingMessages()
                     initialSyncLogicProcessed = true;
                     break;
                 }
-                iamEffectivelyMoreUptimeDevice = false;
-                iamRequestingAllData = true;
-                isAwaitingSyncStartResponse = true;
-                allDrawingHistory.clear();
-
-                SyncMessage_t syncStartMsgBeforeRequest3;
-                syncStartMsgBeforeRequest3.type = MSG_TYPE_SYNC_START;
-                syncStartMsgBeforeRequest3.senderUptime = localCurrentRawUptime;
-                syncStartMsgBeforeRequest3.senderOffset = localCurrentOffset;
-                memset(&syncStartMsgBeforeRequest3.touch_data, 0, sizeof(TouchData_t));
-                sendSyncMessage(&syncStartMsgBeforeRequest3);
-                Serial.println("  发送 MSG_TYPE_SYNC_START (在请求所有绘图前 - CLEAR_AND_REQUEST_UPDATE 路径)");
-
-                SyncMessage_t requestMsg;
-                requestMsg.type = MSG_TYPE_REQUEST_ALL_DRAWINGS;
-                requestMsg.senderUptime = localCurrentRawUptime;
-                requestMsg.senderOffset = localCurrentOffset;
-                memset(&requestMsg.touch_data, 0, sizeof(TouchData_t));
-                sendSyncMessage(&requestMsg);
-                timeRequestSentForAllDrawings = millis();
+                beginRequestAllDrawings();
                 lastKnownPeerUptime = peerRawUptime;
                 lastKnownPeerOffset = peerReceivedOffset;
                 initialSyncLogicProcessed = true;
             }
             else
             {
-                Serial.println("  决策: 收到 CLEAR_AND_REQUEST_UPDATE，但本机有效运行时间并非较短 (或在阈值内)。忽略。");
+                Serial.println("  决策: 收到 CLEAR_AND_REQUEST_UPDATE，但本机应为同步源。忽略请求。");
                 markPeerCanvasSynced(peerKeyClear);
                 if (peerRawUptime != 0)
                     lastKnownPeerUptime = peerRawUptime;
@@ -881,6 +1133,7 @@ void processIncomingMessages()
         case MSG_TYPE_SYNC_START:
         {
             Serial.println("收到 MSG_TYPE_SYNC_START");
+            cancelSignalRecoveryFallback();
             if (iamRequestingAllData && isAwaitingSyncStartResponse && !iamEffectivelyMoreUptimeDevice)
             {
                 Serial.println("  本机作为请求方，收到响应方的 SYNC_START。准备清空并接收数据。");
@@ -1026,7 +1279,8 @@ void sendHeartbeat()
     heartbeatMsg.senderUptime = millis();
     heartbeatMsg.senderOffset = relativeBootTimeOffset;
     memset(&heartbeatMsg.touch_data, 0, sizeof(TouchData_t));
-    heartbeatMsg.totalPointsForSync = 0; // 心跳包不需要这个字段
+    size_t pts = allDrawingHistory.size();
+    heartbeatMsg.totalPointsForSync = (pts > 65535) ? 65535 : (uint16_t)pts;
     // 获取并添加内存信息
     heartbeatMsg.usedMemory = esp_get_free_heap_size(); // 使用 esp_get_free_heap_size 获取可用堆内存
     heartbeatMsg.totalMemory = ESP.getHeapSize(); // 使用 ESP.getHeapSize 获取总堆内存
@@ -1065,7 +1319,16 @@ void checkPeerHeartbeatTimeout()
         peerLastHeartbeat.erase(mac);
         macSet.erase(mac);
         peerInfoMap.erase(mac);
+        peerSignalState.erase(mac);
+        if (pendingSignalRecoveryResync && pendingSignalRecoveryPeer == mac)
+            pendingSignalRecoveryResync = false;
+        if (signalRecoveryFallbackPeer == mac) {
+            signalRecoveryFallbackAtMs = 0;
+            signalRecoveryFallbackPeer = "";
+            signalRecoveryAllowLargerMac = false;
+        }
         // 保留 canvasSyncedPeers / lastCanvasSyncMs：短暂掉线后再上线不得再次全量 restore
+        // （信号变差→恢复由 RSSI 状态机单独触发重同步）
         updateConnectedDevicesCount();
     }
 }

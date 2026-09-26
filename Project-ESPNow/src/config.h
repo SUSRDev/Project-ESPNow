@@ -76,6 +76,17 @@
 #define CANVAS_PAGE_ACT_INFO   3 // 仅同步页数，不强制切页
 #define CANVAS_PAGE_ACT_CLEAR  4 // 仅清空指定页笔迹，不删页
 
+// 清空确认弹窗
+#define CONFIRM_POPUP_W 220
+#define CONFIRM_POPUP_H 110
+#define CONFIRM_POPUP_X ((SCREEN_WIDTH - CONFIRM_POPUP_W) / 2)
+#define CONFIRM_POPUP_Y ((SCREEN_HEIGHT - CONFIRM_POPUP_H) / 2)
+#define CONFIRM_BTN_W 80
+#define CONFIRM_BTN_H 28
+#define CONFIRM_BTN_Y (CONFIRM_POPUP_Y + CONFIRM_POPUP_H - CONFIRM_BTN_H - 12)
+#define CONFIRM_CANCEL_X (CONFIRM_POPUP_X + 18)
+#define CONFIRM_OK_X (CONFIRM_POPUP_X + CONFIRM_POPUP_W - CONFIRM_BTN_W - 18)
+
 // 在线列表刷新间隔
 #define ONLINE_PANEL_REFRESH_MS 500UL
 
@@ -172,6 +183,14 @@
 #define EFFECTIVE_UPTIME_SYNC_THRESHOLD 3000UL     // 有效运行时间差阈值
 #define CANVAS_RESYNC_COOLDOWN_MS 15000UL          // 同步成功后短冷却，避免连环 restore
 
+// 信号变差→恢复后强制重同步画面（滞回，避免临界抖动）
+#define SIGNAL_BAD_RSSI_DBM (-80)                  // ≤ 此值视为差
+#define SIGNAL_GOOD_RSSI_DBM (-68)                 // ≥ 此值视为好
+#define SIGNAL_BAD_HOLD_MS 3500UL                  // 持续差多久才记为 BAD
+#define SIGNAL_GOOD_HOLD_MS 1800UL                 // 持续好多久才触发恢复同步
+#define SIGNAL_RECOVERY_RESYNC_COOLDOWN_MS 25000UL // 两次信号恢复同步最小间隔
+#define CANVAS_FORCE_RESYNC_FLAG 1                 // SyncMessage.touch_data.x：强制重同步
+
 // 心跳包相关常量
 #define HEARTBEAT_SEND_INTERVAL_MS 3000UL // 心跳包发送间隔 (毫秒)
 #define HEARTBEAT_TIMEOUT_MS 12000UL      // 心跳超时
@@ -225,13 +244,16 @@
 #define DEVICE_ID_PREF_KEY "devid"
 #define DEVICE_ID_LONG_PRESS_MS 800UL
 
-// 状态条 / Toast (避开左上按钮与右上 * 颜色按钮)
-#define STATUS_BAR_X 40
-#define STATUS_BAR_Y 1
-#define STATUS_BAR_W (SCREEN_WIDTH - 80)
-#define STATUS_BAR_H 16
+// 状态条 / Toast (避开左上按钮与右上 * 颜色按钮) — 更扁更省空间
+#define STATUS_BAR_X 42
+#define STATUS_BAR_Y 0
+#define STATUS_BAR_W (SCREEN_WIDTH - 84)
+#define STATUS_BAR_H 12
 #define STATUS_TOAST_MS 2800UL
 #define DRAWING_STATUS_MS 1600UL
+
+// 无操作自动息屏（触摸/按键可唤醒；BOOT 短按仍可手动开关）
+#define SCREEN_IDLE_OFF_MS (5UL * 60UL * 1000UL)
 
 // 左侧 UI 保护区 (橡皮擦不可覆盖)
 #define UI_LEFT_SAFE_X_MAX 38

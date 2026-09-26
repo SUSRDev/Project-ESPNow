@@ -16,7 +16,49 @@ static unsigned long lastBreathTime = 0;
 // BOOT 按钮处理
 static unsigned long pressStartTime = 0;
 
+// 自动息屏：最近一次用户操作时间
+static unsigned long lastUserActivityMs = 0;
+
 // --- 函数实现 ---
+
+void noteUserActivity()
+{
+    lastUserActivityMs = millis();
+}
+
+void setScreenPower(bool on)
+{
+    if (on) {
+        if (isScreenOn)
+            return;
+        Serial.println("打开屏幕");
+        digitalWrite(TFT_BL, HIGH);
+        isScreenOn = true;
+        analogWrite(GREEN_LED, 255);
+        hasNewUpdateWhileScreenOff = false;
+        noteUserActivity();
+        if (!inCustomColorMode && currentUIState == UI_STATE_MAIN)
+            updateStatusOverlays();
+    } else {
+        if (!isScreenOn)
+            return;
+        Serial.println("关闭屏幕");
+        digitalWrite(TFT_BL, LOW);
+        isScreenOn = false;
+    }
+}
+
+void checkAutoScreenOff()
+{
+    if (!isScreenOn)
+        return;
+    if (lastUserActivityMs == 0) {
+        lastUserActivityMs = millis();
+        return;
+    }
+    if (millis() - lastUserActivityMs >= SCREEN_IDLE_OFF_MS)
+        setScreenPower(false);
+}
 
 void powerManagerInit() {
     pinMode(BUTTON_IO0, INPUT_PULLUP);
@@ -42,6 +84,7 @@ void powerManagerInit() {
     // 初始时点亮屏幕
     digitalWrite(TFT_BL, HIGH);
     isScreenOn = true;
+    noteUserActivity();
 }
 
 void updateBreathLED() {
@@ -71,20 +114,7 @@ float readBatteryVoltagePercentage() {
 }
 
 void toggleScreen() {
-    if (isScreenOn) {
-        Serial.println("关闭屏幕");
-        digitalWrite(TFT_BL, LOW);
-        isScreenOn = false;
-    } else {
-        Serial.println("打开屏幕");
-        digitalWrite(TFT_BL, HIGH);
-        isScreenOn = true;
-        analogWrite(GREEN_LED, 255); // 如果呼吸灯亮着则将其关闭
-        hasNewUpdateWhileScreenOff = false;
-        if (!inCustomColorMode) { // inCustomColorMode 是来自 ui_manager 的 extern 变量
-            drawDebugInfo();      // drawDebugInfo 是来自 ui_manager 的 extern 变量
-        }
-    }
+    setScreenPower(!isScreenOn);
 }
 
 void handleBootButton() {
@@ -103,6 +133,7 @@ void handleBootButton() {
     } else { // 按钮未按下 (已释放或从未按下)
         if (pressStartTime > 0 && millis() - pressStartTime < 2000) { // 曾被按下，且为短按
             Serial.println("检测到短按IO0按钮");
+            noteUserActivity();
             toggleScreen();
         }
         pressStartTime = 0; // 重置按下开始时间

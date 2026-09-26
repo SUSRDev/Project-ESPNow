@@ -47,6 +47,16 @@ extern bool showSendProgress;      // 是否显示发送进度条
 extern bool showReceiveProgress;   // 是否显示接收进度条
 extern bool isProjectInfoPopupVisible; // 项目信息弹窗是否可见
 extern bool isCoffeePopupVisible;    // "Coffee" 弹窗是否可见
+extern bool isClearConfirmVisible;   // 清空确认弹窗是否可见
+
+// 清空确认类型
+enum ClearConfirmKind_e {
+    CLEAR_CONFIRM_NONE = 0,
+    CLEAR_CONFIRM_ALL,   // 左上角清空全部
+    CLEAR_CONFIRM_PAGE   // 右下角清本页
+};
+typedef enum ClearConfirmKind_e ClearConfirmKind_t;
+extern ClearConfirmKind_t clearConfirmKind;
 extern int screenshotCounter; // 截屏文件计数器
 
 extern int redValue;                // 红色通道值 (0-255)
@@ -115,6 +125,11 @@ void drawCoffeeButton();      // 绘制 "Coffee" 按钮
 void drawChatJoinButton();    // 绘制加入聊天室按钮
 void showCoffeePopup();       // 显示 "Coffee" 弹窗
 void hideCoffeePopup();       // 隐藏 "Coffee" 弹窗
+void showClearConfirm(ClearConfirmKind_t kind); // 清空确认弹窗
+void hideClearConfirm(bool redraw);             // 关闭确认弹窗
+void drawClearConfirmPopup();                   // 绘制确认弹窗
+bool handleClearConfirmTouch(int x, int y);     // true=已处理
+void performFullCanvasReset();                  // 执行全部清空（含广播）
 void showChatRoom();          // 进入群聊
 void hideChatRoom();          // 退出群聊回主界面
 void showChatJoinToast(const char *msg); // 聊天室内短暂加入提示
