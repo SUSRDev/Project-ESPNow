@@ -18,7 +18,9 @@ enum UIState_e {
     UI_STATE_POPUP,        // 弹窗界面 (例如项目信息或 Coffee)
     UI_STATE_PEER_INFO,    // 对端信息界面
     UI_STATE_NAME_EDIT,    // 设备标识编辑界面
-    UI_STATE_CHAT          // 局域网群聊界面
+    UI_STATE_CHAT,         // 局域网群聊界面
+    UI_STATE_ONLINE_LIST,  // 画板在线列表（私聊入口）
+    UI_STATE_SETTINGS      // WiFi / 蓝牙设置
 };
 typedef enum UIState_e UIState_t;
 
@@ -92,10 +94,12 @@ bool isCanvasPagePrevPressed(int x, int y);
 bool isCanvasPageNextPressed(int x, int y);
 bool isCanvasPageClearPressed(int x, int y);
 bool isCanvasFlipPressed(int x, int y);
+bool isCanvasExitPrivPressed(int x, int y);
 void handleCanvasPagePrev();  // 上一页；当前页空则删除
 void handleCanvasPageNext();  // 下一页或新建
 void handleCanvasPageClear(); // 仅清空当前页笔迹（广播）
 void handleCanvasFlip();      // 屏幕 180° 翻转
+void handleCanvasExitPriv();  // 退出私聊画板
 void loadScreenRotation();    // 启动时读取并应用旋转
 uint8_t getScreenRotation();
 bool isUndoButtonPressed(int x, int y);
@@ -114,7 +118,21 @@ extern uint8_t currentCanvasPage;
 extern uint8_t canvasPageCount;
 void drawSignalStrengthInfo(); // 左侧显示对端信号强度
 void updateSignalStrengthDisplay(); // 轮换刷新信号显示
-void updateOnlinePanelLive(); // 在线列表延迟/信号动态刷新
+bool isSignalInfoPressed(int x, int y); // 点击左侧 Signal 进入在线列表
+void showOnlineListScreen();
+void hideOnlineListScreen();
+void drawOnlineListScreen();
+void updateOnlineListScreen();
+bool handleOnlineListTouch(int x, int y); // true=已处理
+void onlineListTouchReleased();
+void updateOnlinePanelLive(); // 聊天室内在线列表延迟/信号动态刷新
+void showPrivInviteDialog(const char *fromId, unsigned long deadlineMs);
+void hidePrivInviteDialog();
+void drawPrivInviteDialog();
+bool handlePrivInviteTouch(int x, int y); // true=已处理
+void updatePrivInviteDialog(); // 倒计时刷新
+void onPrivateCanvasSessionChanged(); // 私聊状态变化时刷新「退」按钮等
+bool isPrivInviteDialogVisible();
 bool detectSdCardPresent();    // 检测是否插入 SD 卡（轻量，勿在画屏前阻塞调用）
 bool isSdCardAvailable();      // 当前是否可用 SD
 void deferSdCardDetection();   // 标记：稍后在 loop 里探测 SD
@@ -134,6 +152,14 @@ void hideProjectInfoPopup();  // 隐藏项目信息弹窗
 // "Coffee" 按钮相关函数
 void drawCoffeeButton();      // 绘制 "Coffee" 按钮
 void drawChatJoinButton();    // 绘制加入聊天室按钮
+void drawSettingsButton();    // 左下「设」
+bool isSettingsButtonPressed(int x, int y);
+void showSettingsScreen();
+void hideSettingsScreen();
+void drawSettingsScreen();
+void updateSettingsScreen();
+bool handleSettingsTouch(int x, int y);
+void settingsTouchReleased();
 void showCoffeePopup();       // 显示 "Coffee" 弹窗
 void hideCoffeePopup();       // 隐藏 "Coffee" 弹窗
 void showClearConfirm(ClearConfirmKind_t kind); // 清空确认弹窗

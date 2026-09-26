@@ -172,7 +172,16 @@ void handleLocalTouch() {
         }
 
         // 首先处理弹窗关闭逻辑 (Coffee 弹窗优先于项目信息弹窗，如果两者都可能存在)
-        if (isClearConfirmVisible) {
+        if (isPrivInviteDialogVisible()) {
+            xy1 = averageXY();
+            if (!xy1.fly) {
+                int mapX = map(xy1.x, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCREEN_WIDTH);
+                int mapY = map(xy1.y, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCREEN_HEIGHT);
+                handlePrivInviteTouch(mapX, mapY);
+                lastLocalPoint.z = 0;
+                return;
+            }
+        } else if (isClearConfirmVisible) {
             xy1 = averageXY();
             if (!xy1.fly) {
                 if (!clearConfirmFingerDown) {
@@ -219,12 +228,36 @@ void handleLocalTouch() {
                     handleChatTouch(mapX, mapY);
                     break;
 
+                case UI_STATE_ONLINE_LIST:
+                    handleOnlineListTouch(mapX, mapY);
+                    break;
+
+                case UI_STATE_SETTINGS:
+                    handleSettingsTouch(mapX, mapY);
+                    break;
+
                 case UI_STATE_MAIN: // 主绘图界面
                     if (inCustomColorMode) {
                         handleCustomColorTouch(mapX, mapY);
                     } else {
                         bool mainRising = !mainUiFingerDown;
                         mainUiFingerDown = true;
+
+                        if (isSettingsButtonPressed(mapX, mapY)) {
+                            if (mainRising && !mainUiPressConsumed) {
+                                mainUiPressConsumed = true;
+                                showSettingsScreen();
+                            }
+                            return;
+                        }
+
+                        if (isSignalInfoPressed(mapX, mapY)) {
+                            if (mainRising && !mainUiPressConsumed) {
+                                mainUiPressConsumed = true;
+                                showOnlineListScreen();
+                            }
+                            return;
+                        }
 
                         if (isChatJoinButtonPressed(mapX, mapY)) {
                             if (mainRising && !mainUiPressConsumed) {
@@ -413,6 +446,14 @@ void handleLocalTouch() {
                             return;
                         }
 
+                        if (isCanvasExitPrivPressed(mapX, mapY)) {
+                            if (mainRising && !mainUiPressConsumed) {
+                                mainUiPressConsumed = true;
+                                handleCanvasExitPriv();
+                            }
+                            return;
+                        }
+
                         if (isCanvasPageClearPressed(mapX, mapY)) {
                             if (mainRising && !mainUiPressConsumed) {
                                 mainUiPressConsumed = true;
@@ -523,6 +564,10 @@ void handleLocalTouch() {
             chatTouchReleased();
         if (currentUIState == UI_STATE_NAME_EDIT)
             nameEditTouchReleased();
+        if (currentUIState == UI_STATE_ONLINE_LIST)
+            onlineListTouchReleased();
+        if (currentUIState == UI_STATE_SETTINGS)
+            settingsTouchReleased();
         // 对端信息按钮抬起：短按打开对端列表
         if (peerInfoPressStart != 0 && !peerInfoLongPressHandled) {
             showPeerInfoScreen();

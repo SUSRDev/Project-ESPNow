@@ -29,9 +29,25 @@ enum MessageType_e // 使用 _e 后缀表示 enum
     MSG_TYPE_CHAT,       // 聊天文本（大厅/私聊/群）
     MSG_TYPE_CHAT_JOIN,  // 加入通知
     MSG_TYPE_CHAT_GROUP, // 群组控制：创建/解散（text 携带协议）
-    MSG_TYPE_CANVAS_PAGE // 画布翻页/新建/删空页（touch_data 携带页信息）
+    MSG_TYPE_CANVAS_PAGE, // 画布翻页/新建/删空页（touch_data 携带页信息）
+    MSG_TYPE_PRIV_INVITE, // 私聊画板邀请
+    MSG_TYPE_PRIV_ACCEPT, // 同意私聊画板
+    MSG_TYPE_PRIV_REJECT, // 拒绝私聊画板
+    MSG_TYPE_PRIV_LEAVE   // 退出私聊画板
 };
 typedef enum MessageType_e MessageType_t; // Typedef for the enum
+
+// 私聊画板控制包（单播+加密会话协商）
+typedef struct PrivCanvasPacket_s {
+    uint8_t magic; // PRIV_CANVAS_MAGIC
+    MessageType_t type;
+    char senderId[DEVICE_ID_MAX_LEN + 1];
+    char targetId[DEVICE_ID_MAX_LEN + 1];
+    uint8_t senderMac[6];
+    uint8_t nonce[8];
+    uint32_t timestamp;
+    uint8_t _sizeTag[11]; // 保证与 SyncMessage/ChatPacket 线长不同
+} PrivCanvasPacket_t;
 
 // 独立聊天包 (与 SyncMessage 分开发送，避免拖大绘图包)
 typedef struct ChatPacket_s {
@@ -65,6 +81,12 @@ typedef struct PeerInfo_s {
     char deviceId[DEVICE_ID_MAX_LEN + 1]; // 对端短标识
     int8_t rssi;                          // 最近一次收到该对端包的 RSSI (dBm)
     uint16_t historyPoints;               // 对端最近通报的笔迹点数（心跳/同步）
+    uint8_t batteryPercent;               // 0-100，来自心跳
+    unsigned long firstSeenMs;            // 本会话首次发现时间
+    unsigned long lastSeenMs;             // 最近收包时间
+    uint16_t latencyMs;                   // 粗测延迟（心跳间隔抖动近似）
+    uint8_t linkCaps;                     // PEER_CAP_ESPNOW / PEER_CAP_WIFI
+    uint8_t peerLinkMode;                 // 对端宣称的链路模式，0xFF=未知
 } PeerInfo_t;
 
 
@@ -99,7 +121,13 @@ extern unsigned long lastRemoteDrawTime; // 远程最后绘制时间 (用于以�
 // 函数声明
 void espNowInit(); // ESP-NOW 初始化
 void OnSyncDataSent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status); // 发送回调 (ESP32 Arduino 3.x)
-void OnSyncDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingDataPtr, int len); // 接收回调
+void OnSyncDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingDataPtr, int len);
+void ingestIncomingPacket(const uint8_t srcMac[6], const uint8_t *data, int len, int8_t rssi);
+// viaWifi=true：来自 UDP；false：来自 ESP-NOW
+void ingestIncomingPacketEx(const uint8_t srcMac[6], const uint8_t *data, int len, int8_t rssi, bool viaWifi);
+bool peerVisibleForLocalMode(const PeerInfo_t &p);
+void notePeerWifiPresence(const uint8_t srcMac[6], const char *deviceId, uint8_t peerMode);
+void purgePeersNotVisibleForWifiOnly();
 void sendSyncMessage(const SyncMessage_t *msg); // 发送同步消息的辅助函数
 void processIncomingMessages(); // 处理接收到的消息队列
 void replayAllDrawings();       // 重播所有绘图历史 (需要 tft 对象)
@@ -112,6 +140,21 @@ std::vector<PeerInfo_t> getPeerInfoList(); // 新增：获取对端信息列表
 void sendChatPacket(MessageType_t type, const char *text); // 兼容：发到大厅
 void sendChatEx(MessageType_t type, uint8_t mode, const char *targetId, const char *text, uint16_t color);
 void processIncomingChatPacket(const ChatPacket_t &pkt); // 处理聊天包
+
+// 私聊画板
+bool isPrivateCanvasActive();
+bool isPrivateCanvasInvitePending(); // 本机发出或收到待确认
+const char *getPrivateCanvasPeerId();
+bool parseMacString(const String &macKey, uint8_t outMac[6]);
+bool ensureUnicastPeer(const uint8_t mac[6]);
+void sendPrivCanvasPacket(const PrivCanvasPacket_t *pkt, const uint8_t *destMacOrNull);
+void invitePrivateCanvas(const char *peerId, const String &peerMac);
+void acceptPrivateCanvasInvite();
+void rejectPrivateCanvasInvite();
+void leavePrivateCanvas();
+void checkPrivateCanvasTimeouts();
+void processIncomingPrivQueue(); // 主循环处理私聊包（勿在 recv 回调里画屏）
+void processIncomingPrivPacket(const PrivCanvasPacket_t &pkt, const uint8_t srcMac[6]);
 
 // 注意: replayAllDrawings 函数依赖于在 esp_now_handler.cpp 中可访问的全局 tft 对象和 drawMainInterface 函数。
 

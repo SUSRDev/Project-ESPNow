@@ -2,6 +2,7 @@
 #include "esp_now_handler.h"
 #include "config.h"     // 包含项目配置常量
 #include "ui_manager.h" // << 添加对 UI 管理器的引用
+#include "transport_manager.h"
 #include <Arduino.h>    // For Serial, millis, etc.
 #include <cstring>      // For memcpy, memset, snprintf
 #include <TFT_eSPI.h> // 需要 TFT_eSPI::color565 等，以及 tft 对象
@@ -9,6 +10,7 @@
 #include <vector> // 用于 getPeerInfoList 返回值
 #include <map> // 用于 std::map
 #include <set>
+#include <queue>
 
 // TFT_eSPI tft 对象和 drawMainInterface 函数在 Project-ESPNow.ino 中定义
 // 通过 extern 声明来在此文件中使用它们
@@ -43,6 +45,10 @@ static long pendingSignalRecoveryPeerOffset = 0;
 static unsigned long signalRecoveryFallbackAtMs = 0;
 static String signalRecoveryFallbackPeer;
 static bool signalRecoveryAllowLargerMac = false;
+
+static void xorDecryptIncomingSync(SyncMessage_t *msg);
+static bool isPrivEncryptedDrawType(MessageType_t t);
+static bool privActivePeerMacEquals(const uint8_t mac[6]);
 
 static String macKeyFromLastPeer()
 {
@@ -79,6 +85,11 @@ static bool parseMacKey(const String &macKey, uint8_t outMac[6])
     for (int i = 0; i < 6; i++)
         outMac[i] = (uint8_t)b[i];
     return true;
+}
+
+bool parseMacString(const String &macKey, uint8_t outMac[6])
+{
+    return parseMacKey(macKey, outMac);
 }
 
 static bool syncBusy()
@@ -151,6 +162,12 @@ esp_now_peer_info_t broadcastPeerInfo;
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // ESP-NOW 广播地址
 std::queue<SyncMessage_t> incomingMessageQueue;                    // ESP-NOW 接收消息队列
 DrawingHistory allDrawingHistory;                        // 所有绘图操作的历史记录
+
+struct PrivIncoming_t {
+    PrivCanvasPacket_t pkt;
+    uint8_t srcMac[6];
+};
+static std::queue<PrivIncoming_t> incomingPrivQueue;
 std::set<String> macSet;                                           // 已发现的对端设备 MAC 地址
 std::map<String, unsigned long> peerLastHeartbeat; // 存储每个对端的最后心跳时间
 
@@ -433,7 +450,7 @@ void processPendingSignalRecoveryResync()
             signalRecoveryFallbackPeer = peerKey;
         }
         Serial.println("信号恢复：本机 MAC 较大，等待对端发起同步");
-        showStatusToast("信号恢复，等待同步…", 2000);
+        showStatusToast("信号恢复，等待同步…", 1000);
         return;
     }
 
@@ -463,7 +480,7 @@ void processPendingSignalRecoveryResync()
     if (recentlyDestructivelyEdited(25000UL))
         amSource = true;
 
-    showStatusToast("信号恢复，同步画面…", 2800);
+    showStatusToast("信号恢复，同步画面…", 1200);
     Serial.print("执行信号恢复画面重同步 vs ");
     Serial.println(peerKey);
 
@@ -525,46 +542,214 @@ void OnSyncDataSent(const esp_now_send_info_t *tx_info, esp_now_send_status_t st
     }
 }
 
-// ESP-NOW 数据接收回调函数
 void OnSyncDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingDataPtr, int len)
 {
+    if (!info || !incomingDataPtr)
+        return;
+    // 仅 WiFi 模式不吃 ESP-NOW，避免列表出现纯 ESP-NOW 设备
+    if (linkModeIsWifiOnly())
+        return;
+    // Drop if same payload already arrived via WiFi (concurrent dual-path)
+    if (transportIsDuplicatePacket(incomingDataPtr, len))
+        return;
+    int8_t rssi = (info->rx_ctrl) ? info->rx_ctrl->rssi : 0;
+    ingestIncomingPacketEx(info->src_addr, incomingDataPtr, len, rssi, false);
+}
+
+bool peerVisibleForLocalMode(const PeerInfo_t &p)
+{
+    if (!linkModeIsWifiOnly())
+        return true;
+    if ((p.linkCaps & PEER_CAP_WIFI) == 0)
+        return false;
+    // 明确宣称仅 ESP-NOW 的不显示（即使误标了 WiFi）
+    if (p.peerLinkMode == LINK_MODE_ESPNOW_ONLY)
+        return false;
+    return true;
+}
+
+void purgePeersNotVisibleForWifiOnly()
+{
+    if (!linkModeIsWifiOnly())
+        return;
+    for (auto it = peerInfoMap.begin(); it != peerInfoMap.end();) {
+        if ((it->second.linkCaps & PEER_CAP_WIFI) == 0) {
+            macSet.erase(it->first);
+            peerLastHeartbeat.erase(it->first);
+            it = peerInfoMap.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void notePeerWifiPresence(const uint8_t srcMac[6], const char *deviceId, uint8_t peerMode)
+{
+    if (!srcMac)
+        return;
+    if (peerMode == LINK_MODE_ESPNOW_ONLY)
+        return;
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             srcMac[0], srcMac[1], srcMac[2], srcMac[3], srcMac[4], srcMac[5]);
+    String macKey = String(macStr);
+    unsigned long nowMs = millis();
+    PeerInfo_t &pi = peerInfoMap[macKey];
+    if (pi.firstSeenMs == 0) {
+        pi.firstSeenMs = nowMs;
+        pi.peerLinkMode = 0xFF;
+    }
+    pi.lastSeenMs = nowMs;
+    pi.macAddress = macKey;
+    pi.linkCaps = (uint8_t)(pi.linkCaps | PEER_CAP_WIFI);
+    if (peerMode <= LINK_MODE_WIFI_ONLY)
+        pi.peerLinkMode = peerMode;
+    if (deviceId && deviceId[0]) {
+        strncpy(pi.deviceId, deviceId, DEVICE_ID_MAX_LEN);
+        pi.deviceId[DEVICE_ID_MAX_LEN] = '\0';
+    }
+    macSet.insert(macKey);
+    peerLastHeartbeat[macKey] = nowMs;
+}
+
+// 统一收包入口（ESP-NOW / WiFi UDP / 蓝牙）
+void ingestIncomingPacket(const uint8_t srcMac[6], const uint8_t *incomingDataPtr, int len, int8_t rssi)
+{
+    ingestIncomingPacketEx(srcMac, incomingDataPtr, len, rssi, false);
+}
+
+void ingestIncomingPacketEx(const uint8_t srcMac[6], const uint8_t *incomingDataPtr, int len, int8_t rssi, bool viaWifi)
+{
+    if (!srcMac || !incomingDataPtr || len <= 0)
+        return;
+    // 仅 WiFi：丢弃非 WiFi 路径（防御）
+    if (linkModeIsWifiOnly() && !viaWifi)
+        return;
+
+    uint8_t macUse[6];
+    memcpy(macUse, srcMac, 6);
+    // 蓝牙可能无 MAC：用全 0，后续用 senderId 补登记
+    bool macAllZero = true;
+    for (int i = 0; i < 6; i++) {
+        if (macUse[i]) { macAllZero = false; break; }
+    }
+
+    auto markCaps = [&](PeerInfo_t &pi) {
+        if (viaWifi)
+            pi.linkCaps = (uint8_t)(pi.linkCaps | PEER_CAP_WIFI);
+        else
+            pi.linkCaps = (uint8_t)(pi.linkCaps | PEER_CAP_ESPNOW);
+        if (pi.peerLinkMode == 0)
+            pi.peerLinkMode = 0xFF;
+    };
+
+    if (len == sizeof(PrivCanvasPacket_t))
+    {
+        PrivCanvasPacket_t privPkt;
+        memcpy(&privPkt, incomingDataPtr, sizeof(privPkt));
+        privPkt.senderId[DEVICE_ID_MAX_LEN] = '\0';
+        privPkt.targetId[DEVICE_ID_MAX_LEN] = '\0';
+        char macStr[18];
+        snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 macUse[0], macUse[1], macUse[2], macUse[3], macUse[4], macUse[5]);
+        String macKey = String(macStr);
+        if (macAllZero && privPkt.senderId[0])
+            macKey = String("ID:") + privPkt.senderId;
+        macSet.insert(macKey);
+        peerLastHeartbeat[macKey] = millis();
+        unsigned long nowMs = millis();
+        PeerInfo_t &pi = peerInfoMap[macKey];
+        if (pi.firstSeenMs == 0) {
+            pi.firstSeenMs = nowMs;
+            pi.peerLinkMode = 0xFF;
+        }
+        if (pi.lastSeenMs > 0 && nowMs >= pi.lastSeenMs)
+            pi.latencyMs = (uint16_t)min(9999UL, nowMs - pi.lastSeenMs);
+        pi.lastSeenMs = nowMs;
+        pi.macAddress = macKey;
+        markCaps(pi);
+        if (rssi)
+            pi.rssi = rssi;
+        if (privPkt.senderId[0]) {
+            strncpy(pi.deviceId, privPkt.senderId, DEVICE_ID_MAX_LEN);
+            pi.deviceId[DEVICE_ID_MAX_LEN] = '\0';
+        }
+        // 勿在 WiFi/ESP-NOW 回调里画 TFT：入队，主循环再处理
+        PrivIncoming_t item;
+        item.pkt = privPkt;
+        if (!macAllZero)
+            memcpy(item.srcMac, macUse, 6);
+        else if (privPkt.senderMac[0] || privPkt.senderMac[5])
+            memcpy(item.srcMac, privPkt.senderMac, 6);
+        else
+            memcpy(item.srcMac, macUse, 6);
+        if (incomingPrivQueue.size() < 8)
+            incomingPrivQueue.push(item);
+        return;
+    }
     if (len == sizeof(SyncMessage_t))
     {
         SyncMessage_t receivedMsg;
         memcpy(&receivedMsg, incomingDataPtr, sizeof(receivedMsg));
         receivedMsg.senderId[DEVICE_ID_MAX_LEN] = '\0';
-        memcpy(lastPeerMac, info->src_addr, 6); // 更新最后通信的对端 MAC
+        if (!macAllZero)
+            memcpy(lastPeerMac, macUse, 6);
+
+        if (isPrivEncryptedDrawType(receivedMsg.type)) {
+            if (isPrivateCanvasActive()) {
+                bool peerOk = privActivePeerMacEquals(macUse) || macAllZero;
+                if (peerOk)
+                    xorDecryptIncomingSync(&receivedMsg);
+                else
+                    return;
+            }
+        }
 
         char macStr[18];
         snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 info->src_addr[0], info->src_addr[1], info->src_addr[2],
-                 info->src_addr[3], info->src_addr[4], info->src_addr[5]);
+                 macUse[0], macUse[1], macUse[2], macUse[3], macUse[4], macUse[5]);
         String macKey = String(macStr);
+        if (macAllZero && receivedMsg.senderId[0])
+            macKey = String("ID:") + receivedMsg.senderId;
         bool isNewPeer = (peerInfoMap.find(macKey) == peerInfoMap.end());
+        unsigned long nowMs = millis();
 
-        macSet.insert(macKey); // 添加到 MAC 地址集合中用于计数
-        peerLastHeartbeat[macKey] = millis(); // 更新对端的最后心跳时间
+        macSet.insert(macKey);
+        peerLastHeartbeat[macKey] = nowMs;
 
-        // 更新或添加对端详细信息
-        peerInfoMap[macKey].macAddress = macKey;
-        peerInfoMap[macKey].effectiveUptime = receivedMsg.senderUptime + receivedMsg.senderOffset;
-        peerInfoMap[macKey].usedMemory = receivedMsg.usedMemory;
-        peerInfoMap[macKey].totalMemory = receivedMsg.totalMemory;
+        PeerInfo_t &pi = peerInfoMap[macKey];
+        if (pi.firstSeenMs == 0) {
+            pi.firstSeenMs = nowMs;
+            pi.peerLinkMode = 0xFF;
+        }
+        if (pi.lastSeenMs > 0 && nowMs >= pi.lastSeenMs)
+            pi.latencyMs = (uint16_t)min(9999UL, nowMs - pi.lastSeenMs);
+        pi.lastSeenMs = nowMs;
+        pi.macAddress = macKey;
+        markCaps(pi);
+        pi.effectiveUptime = receivedMsg.senderUptime + receivedMsg.senderOffset;
+        pi.usedMemory = receivedMsg.usedMemory;
+        pi.totalMemory = receivedMsg.totalMemory;
         if (receivedMsg.type == MSG_TYPE_HEARTBEAT ||
             receivedMsg.type == MSG_TYPE_UPTIME_INFO ||
             receivedMsg.type == MSG_TYPE_SYNC_START ||
             receivedMsg.type == MSG_TYPE_ALL_DRAWINGS_COMPLETE) {
-            peerInfoMap[macKey].historyPoints = receivedMsg.totalPointsForSync;
+            pi.historyPoints = receivedMsg.totalPointsForSync;
         }
-        if (info->rx_ctrl) {
-            peerInfoMap[macKey].rssi = info->rx_ctrl->rssi;
-            updatePeerSignalQuality(macKey, info->rx_ctrl->rssi,
+        if (receivedMsg.type == MSG_TYPE_HEARTBEAT) {
+            int bat = receivedMsg.touch_data.x;
+            if (bat < 0) bat = 0;
+            if (bat > 100) bat = 100;
+            pi.batteryPercent = (uint8_t)bat;
+        }
+        if (rssi) {
+            pi.rssi = rssi;
+            updatePeerSignalQuality(macKey, rssi,
                                     receivedMsg.senderUptime, receivedMsg.senderOffset);
         }
         if (receivedMsg.senderId[0]) {
-            strncpy(peerInfoMap[macKey].deviceId, receivedMsg.senderId, DEVICE_ID_MAX_LEN);
-            peerInfoMap[macKey].deviceId[DEVICE_ID_MAX_LEN] = '\0';
-            // 对端 ID 与本机相同 → 冲突提示
+            strncpy(pi.deviceId, receivedMsg.senderId, DEVICE_ID_MAX_LEN);
+            pi.deviceId[DEVICE_ID_MAX_LEN] = '\0';
             if (localDeviceId[0]) {
                 const char *a = localDeviceId;
                 const char *b = receivedMsg.senderId;
@@ -586,15 +771,14 @@ void OnSyncDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData
                         drawNameEditScreen();
                 }
             }
-        } else if (peerInfoMap[macKey].deviceId[0] == '\0') {
-            snprintf(peerInfoMap[macKey].deviceId, sizeof(peerInfoMap[macKey].deviceId),
-                     "%02X%02X", info->src_addr[4], info->src_addr[5]);
+        } else if (pi.deviceId[0] == '\0' && !macAllZero) {
+            snprintf(pi.deviceId, sizeof(pi.deviceId),
+                     "%02X%02X", macUse[4], macUse[5]);
         }
 
         if (isNewPeer) {
-            // 对端重新出现：清同步标记，马上发一次 UPTIME 触发恢复
             clearPeerCanvasSyncState(macKey);
-            peerJoinedNotify(peerInfoMap[macKey].deviceId);
+            peerJoinedNotify(pi.deviceId);
             SyncMessage_t urgent;
             memset(&urgent, 0, sizeof(urgent));
             urgent.type = MSG_TYPE_UPTIME_INFO;
@@ -604,7 +788,7 @@ void OnSyncDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData
             sendSyncMessage(&urgent);
         }
 
-        incomingMessageQueue.push(receivedMsg); // 将消息放入队列等待处理
+        incomingMessageQueue.push(receivedMsg);
     }
     else if (len == sizeof(ChatPacket_t))
     {
@@ -616,39 +800,49 @@ void OnSyncDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData
 
         char macStr[18];
         snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 info->src_addr[0], info->src_addr[1], info->src_addr[2],
-                 info->src_addr[3], info->src_addr[4], info->src_addr[5]);
+                 macUse[0], macUse[1], macUse[2], macUse[3], macUse[4], macUse[5]);
         String macKey = String(macStr);
+        if (macAllZero && chatPkt.senderId[0])
+            macKey = String("ID:") + chatPkt.senderId;
         macSet.insert(macKey);
         peerLastHeartbeat[macKey] = millis();
-        if (info->rx_ctrl) {
-            peerInfoMap[macKey].rssi = info->rx_ctrl->rssi;
-            updatePeerSignalQuality(macKey, info->rx_ctrl->rssi, 0, 0);
+        PeerInfo_t &pi = peerInfoMap[macKey];
+        if (pi.firstSeenMs == 0) {
+            pi.firstSeenMs = millis();
+            pi.peerLinkMode = 0xFF;
         }
-        peerInfoMap[macKey].macAddress = macKey;
+        pi.lastSeenMs = millis();
+        markCaps(pi);
+        if (rssi) {
+            pi.rssi = rssi;
+            updatePeerSignalQuality(macKey, rssi, 0, 0);
+        }
+        pi.macAddress = macKey;
         if (chatPkt.senderId[0]) {
-            strncpy(peerInfoMap[macKey].deviceId, chatPkt.senderId, DEVICE_ID_MAX_LEN);
-            peerInfoMap[macKey].deviceId[DEVICE_ID_MAX_LEN] = '\0';
+            strncpy(pi.deviceId, chatPkt.senderId, DEVICE_ID_MAX_LEN);
+            pi.deviceId[DEVICE_ID_MAX_LEN] = '\0';
         }
 
         processIncomingChatPacket(chatPkt);
     }
     else if (len == strlen("XX:XX:XX:XX:XX:XX") && incomingDataPtr[0] != '{')
     {
-        // 处理旧版或特定的 MAC 地址广播 (如果项目中有这种逻辑)
         char macStr[18];
         memcpy(macStr, incomingDataPtr, len);
         macStr[len] = '\0';
         String macKey = String(macStr);
         bool isNewPeer = (peerInfoMap.find(macKey) == peerInfoMap.end());
         macSet.insert(macKey);
-        peerLastHeartbeat[macKey] = millis(); // 更新对端的最后心跳时间
+        peerLastHeartbeat[macKey] = millis();
         if (isNewPeer) {
             peerInfoMap[macKey].macAddress = macKey;
             peerInfoMap[macKey].deviceId[0] = '\0';
+            peerInfoMap[macKey].peerLinkMode = 0xFF;
+            markCaps(peerInfoMap[macKey]);
             peerJoinedNotify(macStr);
+        } else {
+            markCaps(peerInfoMap[macKey]);
         }
-        // 对于旧版消息，我们没有内存信息，只更新心跳
     }
     else
     {
@@ -659,19 +853,433 @@ void OnSyncDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData
     }
 }
 
-// 发送同步消息的辅助函数
+extern uint8_t currentCanvasPage;
+extern uint8_t canvasPageCount;
+extern void paintCurrentCanvasPage();
+extern void showStatusToast(const char *msg, unsigned long durationMs);
+extern void showPrivInviteDialog(const char *fromId, unsigned long deadlineMs);
+extern void hidePrivInviteDialog();
+extern void onPrivateCanvasSessionChanged();
+
+enum PrivCanvasPhase_e {
+    PRIV_PHASE_IDLE = 0,
+    PRIV_PHASE_OUTGOING, // 已发出邀请
+    PRIV_PHASE_INCOMING, // 收到邀请待确认
+    PRIV_PHASE_ACTIVE
+};
+
+static PrivCanvasPhase_e privPhase = PRIV_PHASE_IDLE;
+static char privPeerId[DEVICE_ID_MAX_LEN + 1] = {0};
+static uint8_t privPeerMac[6] = {0};
+static uint8_t privSessionKey[8] = {0};
+static uint8_t privLocalNonce[8] = {0};
+static unsigned long privInviteDeadlineMs = 0;
+static DrawingHistory publicHistoryBackup;
+static uint8_t publicPageBackup = 0;
+static uint8_t publicPageCountBackup = 1;
+static bool publicHistorySaved = false;
+
+bool isPrivateCanvasActive() { return privPhase == PRIV_PHASE_ACTIVE; }
+bool isPrivateCanvasInvitePending()
+{
+    return privPhase == PRIV_PHASE_OUTGOING || privPhase == PRIV_PHASE_INCOMING;
+}
+const char *getPrivateCanvasPeerId() { return privPeerId; }
+
+static void fillRandomNonce(uint8_t *n, size_t len)
+{
+    for (size_t i = 0; i < len; i++)
+        n[i] = (uint8_t)(esp_random() & 0xFF);
+}
+
+static void deriveSessionKey(const uint8_t *a, const uint8_t *b)
+{
+    for (int i = 0; i < 8; i++)
+        privSessionKey[i] = a[i] ^ b[i];
+}
+
+static bool isPrivEncryptedDrawType(MessageType_t t)
+{
+    return t == MSG_TYPE_DRAW_POINT || t == MSG_TYPE_CANVAS_PAGE ||
+           t == MSG_TYPE_SYNC_START || t == MSG_TYPE_ALL_DRAWINGS_COMPLETE ||
+           t == MSG_TYPE_REQUEST_ALL_DRAWINGS || t == MSG_TYPE_RESET_CANVAS ||
+           t == MSG_TYPE_CLEAR_AND_REQUEST_UPDATE;
+}
+
+static bool privActivePeerMacEquals(const uint8_t mac[6])
+{
+    return privPhase == PRIV_PHASE_ACTIVE && mac && memcmp(mac, privPeerMac, 6) == 0;
+}
+
+static void xorEncryptSyncMessage(SyncMessage_t *msg)
+{
+    if (!msg || privPhase != PRIV_PHASE_ACTIVE)
+        return;
+    uint8_t *p = (uint8_t *)msg;
+    // 保留 type 明文便于路由；其余加密
+    for (size_t i = sizeof(MessageType_t); i < sizeof(SyncMessage_t); i++)
+        p[i] ^= privSessionKey[i % 8];
+}
+
+static void xorDecryptIncomingSync(SyncMessage_t *msg)
+{
+    xorEncryptSyncMessage(msg); // XOR 对称
+}
+
+bool ensureUnicastPeer(const uint8_t mac[6])
+{
+    if (!mac)
+        return false;
+    if (esp_now_is_peer_exist(mac))
+        return true;
+    esp_now_peer_info_t p;
+    memset(&p, 0, sizeof(p));
+    memcpy(p.peer_addr, mac, 6);
+    p.channel = 0;
+    p.encrypt = false;
+    p.ifidx = WIFI_IF_STA;
+    return esp_now_add_peer(&p) == ESP_OK;
+}
+
+static void savePublicHistoryForPrivate()
+{
+    publicHistoryBackup.clear();
+    const size_t n = allDrawingHistory.size();
+    for (size_t i = 0; i < n; i++)
+        publicHistoryBackup.push_back(allDrawingHistory[i]);
+    publicPageBackup = currentCanvasPage;
+    publicPageCountBackup = canvasPageCount ? canvasPageCount : 1;
+    publicHistorySaved = true;
+    allDrawingHistory.clear();
+    clearCanvasRedoStack();
+    currentCanvasPage = 0;
+    canvasPageCount = 1;
+}
+
+static void restorePublicHistoryFromPrivate()
+{
+    allDrawingHistory.clear();
+    clearCanvasRedoStack();
+    if (publicHistorySaved) {
+        const size_t n = publicHistoryBackup.size();
+        for (size_t i = 0; i < n; i++)
+            allDrawingHistory.push_back(publicHistoryBackup[i]);
+        publicHistoryBackup.clear();
+        currentCanvasPage = publicPageBackup;
+        canvasPageCount = publicPageCountBackup ? publicPageCountBackup : 1;
+        publicHistorySaved = false;
+    } else {
+        currentCanvasPage = 0;
+        canvasPageCount = 1;
+    }
+}
+
+static bool macEqual(const uint8_t *a, const uint8_t *b)
+{
+    return memcmp(a, b, 6) == 0;
+}
+
+static void enterPrivateActive(const char *peerId, const uint8_t peerMac[6],
+                               const uint8_t *nonceA, const uint8_t *nonceB)
+{
+    strncpy(privPeerId, peerId ? peerId : "Peer", DEVICE_ID_MAX_LEN);
+    privPeerId[DEVICE_ID_MAX_LEN] = '\0';
+    memcpy(privPeerMac, peerMac, 6);
+    deriveSessionKey(nonceA, nonceB);
+    ensureUnicastPeer(privPeerMac);
+    if (!publicHistorySaved)
+        savePublicHistoryForPrivate();
+    privPhase = PRIV_PHASE_ACTIVE;
+    privInviteDeadlineMs = 0;
+    hidePrivInviteDialog();
+    onPrivateCanvasSessionChanged();
+    char tip[40];
+    snprintf(tip, sizeof(tip), "私聊画板:%s", privPeerId);
+    showStatusToast(tip, 2500);
+    if (currentUIState == UI_STATE_MAIN)
+        paintCurrentCanvasPage();
+}
+
+void sendPrivCanvasPacket(const PrivCanvasPacket_t *pkt, const uint8_t *destMacOrNull)
+{
+    if (!pkt)
+        return;
+    static_assert(sizeof(PrivCanvasPacket_t) != sizeof(SyncMessage_t), "Priv/Sync size collide");
+    static_assert(sizeof(PrivCanvasPacket_t) != sizeof(ChatPacket_t), "Priv/Chat size collide");
+    // 私聊控制包优先走 ESP-NOW（单播 peer + 广播兜底由调用方决定）
+    if (destMacOrNull)
+        ensureUnicastPeer(destMacOrNull);
+    if (!transportSend((const uint8_t *)pkt, sizeof(PrivCanvasPacket_t), destMacOrNull)) {
+        Serial.println("发送私聊包失败(全通道)");
+        if (!linkModeIsWifiOnly()) {
+            const uint8_t *dest = destMacOrNull ? destMacOrNull : broadcastAddress;
+            if (esp_now_send(dest, (uint8_t *)pkt, sizeof(PrivCanvasPacket_t)) != ESP_OK)
+                Serial.println("ESP-NOW 私聊包重试仍失败");
+        }
+    }
+}
+
+void invitePrivateCanvas(const char *peerId, const String &peerMac)
+{
+    if (!peerId || !peerId[0])
+        return;
+    if (privPhase != PRIV_PHASE_IDLE) {
+        showStatusToast("已在私聊流程中", 1500);
+        return;
+    }
+    uint8_t mac[6];
+    if (!parseMacKey(peerMac, mac)) {
+        showStatusToast("MAC无效", 1200);
+        return;
+    }
+    fillRandomNonce(privLocalNonce, 8);
+    strncpy(privPeerId, peerId, DEVICE_ID_MAX_LEN);
+    privPeerId[DEVICE_ID_MAX_LEN] = '\0';
+    memcpy(privPeerMac, mac, 6);
+    privPhase = PRIV_PHASE_OUTGOING;
+    privInviteDeadlineMs = millis() + PRIV_CANVAS_INVITE_TIMEOUT_MS;
+
+    PrivCanvasPacket_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.magic = PRIV_CANVAS_MAGIC;
+    pkt.type = MSG_TYPE_PRIV_INVITE;
+    strncpy(pkt.senderId, localDeviceId, DEVICE_ID_MAX_LEN);
+    strncpy(pkt.targetId, peerId, DEVICE_ID_MAX_LEN);
+    esp_wifi_get_mac(WIFI_IF_STA, pkt.senderMac);
+    memcpy(pkt.nonce, privLocalNonce, 8);
+    pkt.timestamp = millis();
+    ensureUnicastPeer(mac);
+    sendPrivCanvasPacket(&pkt, mac);
+    // 广播一份兜底（目标按 targetId 过滤）
+    sendPrivCanvasPacket(&pkt, nullptr);
+
+    char tip[40];
+    snprintf(tip, sizeof(tip), "邀请%s中…", peerId);
+    showStatusToast(tip, 2000);
+    onPrivateCanvasSessionChanged();
+}
+
+void acceptPrivateCanvasInvite()
+{
+    if (privPhase != PRIV_PHASE_INCOMING)
+        return;
+    fillRandomNonce(privLocalNonce, 8);
+
+    PrivCanvasPacket_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.magic = PRIV_CANVAS_MAGIC;
+    pkt.type = MSG_TYPE_PRIV_ACCEPT;
+    strncpy(pkt.senderId, localDeviceId, DEVICE_ID_MAX_LEN);
+    strncpy(pkt.targetId, privPeerId, DEVICE_ID_MAX_LEN);
+    esp_wifi_get_mac(WIFI_IF_STA, pkt.senderMac);
+    memcpy(pkt.nonce, privLocalNonce, 8);
+    pkt.timestamp = millis();
+    sendPrivCanvasPacket(&pkt, privPeerMac);
+    sendPrivCanvasPacket(&pkt, nullptr);
+
+    // 邀请方 nonce 暂存在 privSessionKey 临时区：邀请时已把对方 nonce 存入 privSessionKey
+    uint8_t peerNonce[8];
+    memcpy(peerNonce, privSessionKey, 8);
+    enterPrivateActive(privPeerId, privPeerMac, peerNonce, privLocalNonce);
+}
+
+void rejectPrivateCanvasInvite()
+{
+    if (privPhase != PRIV_PHASE_INCOMING)
+        return;
+    PrivCanvasPacket_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.magic = PRIV_CANVAS_MAGIC;
+    pkt.type = MSG_TYPE_PRIV_REJECT;
+    strncpy(pkt.senderId, localDeviceId, DEVICE_ID_MAX_LEN);
+    strncpy(pkt.targetId, privPeerId, DEVICE_ID_MAX_LEN);
+    esp_wifi_get_mac(WIFI_IF_STA, pkt.senderMac);
+    pkt.timestamp = millis();
+    sendPrivCanvasPacket(&pkt, privPeerMac);
+    sendPrivCanvasPacket(&pkt, nullptr);
+
+    privPhase = PRIV_PHASE_IDLE;
+    privPeerId[0] = 0;
+    memset(privPeerMac, 0, 6);
+    privInviteDeadlineMs = 0;
+    hidePrivInviteDialog();
+    showStatusToast("已拒绝私聊", 1500);
+    onPrivateCanvasSessionChanged();
+}
+
+void leavePrivateCanvas()
+{
+    if (privPhase == PRIV_PHASE_IDLE)
+        return;
+    if (privPhase == PRIV_PHASE_ACTIVE) {
+        PrivCanvasPacket_t pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.magic = PRIV_CANVAS_MAGIC;
+        pkt.type = MSG_TYPE_PRIV_LEAVE;
+        strncpy(pkt.senderId, localDeviceId, DEVICE_ID_MAX_LEN);
+        strncpy(pkt.targetId, privPeerId, DEVICE_ID_MAX_LEN);
+        esp_wifi_get_mac(WIFI_IF_STA, pkt.senderMac);
+        pkt.timestamp = millis();
+        sendPrivCanvasPacket(&pkt, privPeerMac);
+        sendPrivCanvasPacket(&pkt, nullptr);
+        restorePublicHistoryFromPrivate();
+    }
+    privPhase = PRIV_PHASE_IDLE;
+    privPeerId[0] = 0;
+    memset(privPeerMac, 0, 6);
+    memset(privSessionKey, 0, 8);
+    privInviteDeadlineMs = 0;
+    hidePrivInviteDialog();
+    showStatusToast("已退出私聊画板", 1800);
+    onPrivateCanvasSessionChanged();
+    if (currentUIState == UI_STATE_MAIN)
+        paintCurrentCanvasPage();
+}
+
+void checkPrivateCanvasTimeouts()
+{
+    if (privInviteDeadlineMs == 0)
+        return;
+    if (privPhase != PRIV_PHASE_OUTGOING && privPhase != PRIV_PHASE_INCOMING)
+        return;
+    if ((long)(millis() - privInviteDeadlineMs) < 0)
+        return;
+    if (privPhase == PRIV_PHASE_INCOMING)
+        hidePrivInviteDialog();
+    privPhase = PRIV_PHASE_IDLE;
+    privPeerId[0] = 0;
+    memset(privPeerMac, 0, 6);
+    privInviteDeadlineMs = 0;
+    showStatusToast("私聊邀请超时", 2000);
+    onPrivateCanvasSessionChanged();
+}
+
+static bool privIdEquals(const char *a, const char *b)
+{
+    if (!a || !b)
+        return false;
+    while (*a && *b) {
+        char ca = *a++;
+        char cb = *b++;
+        if (ca >= 'A' && ca <= 'Z')
+            ca = (char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z')
+            cb = (char)(cb + 32);
+        if (ca != cb)
+            return false;
+    }
+    return *a == *b;
+}
+
+void processIncomingPrivQueue()
+{
+    while (!incomingPrivQueue.empty()) {
+        PrivIncoming_t item = incomingPrivQueue.front();
+        incomingPrivQueue.pop();
+        processIncomingPrivPacket(item.pkt, item.srcMac);
+    }
+}
+
+void processIncomingPrivPacket(const PrivCanvasPacket_t &pkt, const uint8_t srcMac[6])
+{
+    if (pkt.magic != PRIV_CANVAS_MAGIC)
+        return;
+    // 仅目标为本机的邀请/应答才处理（LEAVE 也校验会话）
+    if (pkt.type == MSG_TYPE_PRIV_INVITE || pkt.type == MSG_TYPE_PRIV_ACCEPT ||
+        pkt.type == MSG_TYPE_PRIV_REJECT) {
+        if (!privIdEquals(pkt.targetId, localDeviceId))
+            return;
+    }
+
+    switch (pkt.type) {
+    case MSG_TYPE_PRIV_INVITE:
+        if (privPhase != PRIV_PHASE_IDLE) {
+            // 忙：自动拒绝
+            PrivCanvasPacket_t rej;
+            memset(&rej, 0, sizeof(rej));
+            rej.magic = PRIV_CANVAS_MAGIC;
+            rej.type = MSG_TYPE_PRIV_REJECT;
+            strncpy(rej.senderId, localDeviceId, DEVICE_ID_MAX_LEN);
+            strncpy(rej.targetId, pkt.senderId, DEVICE_ID_MAX_LEN);
+            esp_wifi_get_mac(WIFI_IF_STA, rej.senderMac);
+            rej.timestamp = millis();
+            sendPrivCanvasPacket(&rej, srcMac);
+            return;
+        }
+        strncpy(privPeerId, pkt.senderId, DEVICE_ID_MAX_LEN);
+        privPeerId[DEVICE_ID_MAX_LEN] = '\0';
+        memcpy(privPeerMac, srcMac, 6);
+        // 暂存对方 nonce 到 sessionKey 槽
+        memcpy(privSessionKey, pkt.nonce, 8);
+        privPhase = PRIV_PHASE_INCOMING;
+        privInviteDeadlineMs = millis() + PRIV_CANVAS_INVITE_TIMEOUT_MS;
+        // 先刷新列表/按钮，再画弹窗，避免 ONLINE_LIST 全屏重绘盖掉邀请框
+        onPrivateCanvasSessionChanged();
+        showPrivInviteDialog(privPeerId, privInviteDeadlineMs);
+        break;
+
+    case MSG_TYPE_PRIV_ACCEPT:
+        if (privPhase != PRIV_PHASE_OUTGOING)
+            return;
+        if (!privIdEquals(pkt.senderId, privPeerId))
+            return;
+        enterPrivateActive(privPeerId, srcMac, privLocalNonce, pkt.nonce);
+        break;
+
+    case MSG_TYPE_PRIV_REJECT:
+        if (privPhase != PRIV_PHASE_OUTGOING)
+            return;
+        privPhase = PRIV_PHASE_IDLE;
+        privInviteDeadlineMs = 0;
+        showStatusToast("对方拒绝私聊", 2000);
+        privPeerId[0] = 0;
+        onPrivateCanvasSessionChanged();
+        break;
+
+    case MSG_TYPE_PRIV_LEAVE:
+        if (privPhase == PRIV_PHASE_ACTIVE &&
+            (macEqual(srcMac, privPeerMac) || strcmp(pkt.senderId, privPeerId) == 0)) {
+            restorePublicHistoryFromPrivate();
+            privPhase = PRIV_PHASE_IDLE;
+            privPeerId[0] = 0;
+            memset(privPeerMac, 0, 6);
+            memset(privSessionKey, 0, 8);
+            showStatusToast("对方退出私聊", 2000);
+            onPrivateCanvasSessionChanged();
+            if (currentUIState == UI_STATE_MAIN)
+                paintCurrentCanvasPage();
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 void sendSyncMessage(const SyncMessage_t *msg)
 {
     SyncMessage_t out = *msg;
     applySenderId(&out);
-    // 调用前应确保 msg->senderUptime 和 msg->senderOffset 已正确设置
-    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&out, sizeof(SyncMessage_t));
-    if (result != ESP_OK)
-    {
+
+    // 心跳/UPTIME/发现类始终广播；绘图类在私聊时单播并加密
+    bool privDraw = isPrivateCanvasActive() &&
+                    (out.type == MSG_TYPE_DRAW_POINT || out.type == MSG_TYPE_CANVAS_PAGE ||
+                     out.type == MSG_TYPE_SYNC_START || out.type == MSG_TYPE_ALL_DRAWINGS_COMPLETE ||
+                     out.type == MSG_TYPE_REQUEST_ALL_DRAWINGS || out.type == MSG_TYPE_RESET_CANVAS ||
+                     out.type == MSG_TYPE_CLEAR_AND_REQUEST_UPDATE);
+
+    if (privDraw) {
+        xorEncryptSyncMessage(&out);
+        ensureUnicastPeer(privPeerMac);
+        if (!transportSend((const uint8_t *)&out, sizeof(SyncMessage_t), privPeerMac)) {
+            Serial.println("私聊发送失败(全通道)");
+        }
+        return;
+    }
+
+    if (!transportSend((const uint8_t *)&out, sizeof(SyncMessage_t), nullptr)) {
         Serial.print("发送 SyncMessage 类型 ");
         Serial.print(out.type);
-        Serial.print(" 错误: ");
-        Serial.println(esp_err_to_name(result));
+        Serial.println(" 失败(全通道)");
     }
 }
 
@@ -832,41 +1440,9 @@ void processIncomingMessages()
 
             if (isReceivingDrawingData)
             {
-                // 场景1: 历史同步 — 聊天界面打开时只收数据不画布，避免叠在聊天室上
+                // 空闲/全量同步：只入库，不逐点动画；结束后一次性 paintCurrentCanvasPage
                 allDrawingHistory.push_back(currentPointData);
                 receivedHistoryPointCount++;
-                if ((receivedHistoryPointCount & 15) == 0 || receivedHistoryPointCount >= totalPointsExpectedFromPeer) {
-                    if (!shouldSkipCanvasPaint())
-                        updateReceiveProgress(receivedHistoryPointCount, totalPointsExpectedFromPeer);
-                }
-                if (!shouldSkipCanvasPaint() && onViewPage) {
-                    if (currentPointData.color == TFT_BLACK) {
-                        int r = resolveEraserRadius(currentPointData.brushR);
-                        bool hitUi = false;
-                        if (strokeContinue && lastRemoteColor == TFT_BLACK &&
-                            (currentPointData.timestamp - lastRemoteDrawTime <= TOUCH_STROKE_INTERVAL)) {
-                            hitUi = applyEraserSegment(lastRemotePoint.x, lastRemotePoint.y,
-                                                       mapX, mapY, r);
-                        } else {
-                            hitUi = applyEraserDot(mapX, mapY, r);
-                        }
-                        if (hitUi)
-                            redrawUiChrome();
-                    } else {
-                        int r = resolveBrushRadius(currentPointData.brushR);
-                        if (!strokeContinue ||
-                            currentPointData.timestamp - lastRemoteDrawTime > TOUCH_STROKE_INTERVAL ||
-                            lastRemoteColor == TFT_BLACK)
-                            applyBrushDot(mapX, mapY, currentPointData.color, r);
-                        else
-                            applyBrushSegment(lastRemotePoint.x, lastRemotePoint.y, mapX, mapY,
-                                              currentPointData.color, r);
-                    }
-                } else if (!onViewPage) {
-                    // 其它页笔迹只入库，同步结束后按当前页重放
-                } else {
-                    pendingCanvasRedrawAfterChat = true;
-                }
                 lastRemotePoint.x = mapX;
                 lastRemotePoint.y = mapY;
                 lastRemotePoint.z = 1;
@@ -875,7 +1451,7 @@ void processIncomingMessages()
                 lastRemotePage = currentPointData.page;
                 if (!isScreenOn)
                     hasNewUpdateWhileScreenOff = true;
-                if ((receivedHistoryPointCount & 63) == 0)
+                if ((receivedHistoryPointCount & 127) == 0)
                     yield();
             }
             else if (!iamRequestingAllData && !isSendingDrawingData && !isAwaitingSyncStartResponse)
@@ -999,13 +1575,10 @@ void processIncomingMessages()
             sendSyncMessage(&syncStartMsgBeforeSending);
             Serial.println("  发送 MSG_TYPE_SYNC_START (准备发送历史数据，将开始分批发送)");
 
-            if (!allDrawingHistory.empty())
-                updateSendProgress(0, allDrawingHistory.size());
-            else
-                hideSendProgress();
+            // 空闲同步：不播发送进度圈 / toast（接收端也静默一次性重绘）
+            hideSendProgress();
             isSendingDrawingData = true;
             currentHistorySendIndex = 0;
-            showStatusToast("正在广播笔迹…");
             break;
         }
         case MSG_TYPE_ALL_DRAWINGS_COMPLETE:
@@ -1053,7 +1626,7 @@ void processIncomingMessages()
                 if (shouldSkipCanvasPaint()) {
                     pendingCanvasRedrawAfterChat = true;
                 } else {
-                    historyRestoredNotify(msg.senderId[0] ? msg.senderId : nullptr);
+                    // 空闲同步结束：一次性重绘，无逐点动画
                     paintCurrentCanvasPage();
                 }
 
@@ -1229,11 +1802,11 @@ void processIncomingMessages()
 
                 allDrawingHistory.clear();
                 clearCanvasRedoStack();
-                if (shouldSkipCanvasPaint()) {
+                // 空闲同步：不清屏、不播进度动画，收完后一次性 paint
+                // （避免逐点“动画”和中间闪屏）
+                if (shouldSkipCanvasPaint())
                     pendingCanvasRedrawAfterChat = true;
-                } else {
-                    clearScreenAndCache();
-                }
+
                 lastRemotePoint.x = 0;
                 lastRemotePoint.y = 0;
                 lastRemotePoint.z = 0;
@@ -1247,23 +1820,15 @@ void processIncomingMessages()
 
                 totalPointsExpectedFromPeer = msg.totalPointsForSync;
                 receivedHistoryPointCount = 0;
-                if (!shouldSkipCanvasPaint()) {
-                    char buf[40];
-                    snprintf(buf, sizeof(buf), "同步自 %s…", msg.senderId[0] ? msg.senderId : "对端");
-                    showStatusToast(buf, 4000);
-                    if (totalPointsExpectedFromPeer > 0)
-                        updateReceiveProgress(receivedHistoryPointCount, totalPointsExpectedFromPeer);
-                    else
-                        hideReceiveProgress();
-                }
+                hideReceiveProgress();
 
                 lastKnownPeerUptime = peerRawUptime;
                 lastKnownPeerOffset = peerReceivedOffset;
-                Serial.print("  屏幕已清空。准备从对端 (raw uptime: ");
+                Serial.print("  静默同步：准备从对端 (raw uptime: ");
                 Serial.print(peerRawUptime);
                 Serial.print(", total points: ");
                 Serial.print(totalPointsExpectedFromPeer);
-                Serial.println(") 同步数据。");
+                Serial.println(") 接收数据。");
             }
             else if (isSendingDrawingData)
             {
@@ -1321,7 +1886,8 @@ void processIncomingMessages()
             historyPointMsg.touch_data = drawData;
 
             sendSyncMessage(&historyPointMsg);
-            delay(5); // 在每个点发送后加入一个小的 delay(1)
+            // WiFi 并发辅助时少延时；纯 ESP-NOW 略延时防刷屏丢包
+            delay(wifiAssistActive() ? 1 : 3);
 
             currentHistorySendIndex++;
             pointsSentThisCycle++;
@@ -1338,15 +1904,13 @@ void processIncomingMessages()
             sendSyncMessage(&completeMsg);
 
             Serial.println("  所有历史绘图数据已分批发送完毕。发送了 ALL_DRAWINGS_COMPLETE。");
-            updateSendProgress(currentHistorySendIndex, allDrawingHistory.size()); // 最后更新一次确保是100%
-            // hideSendProgress(); // 或者在 updateSendProgress 内部处理完成后的隐藏
+            hideSendProgress();
             isSendingDrawingData = false;
             // currentHistorySendIndex = 0;
         }
         else if (pointsSentThisCycle > 0)
         {
-            // 当前批次已发送，但还有更多数据
-            updateSendProgress(currentHistorySendIndex, allDrawingHistory.size()); // 更新发送进度
+            // 空闲同步不刷新进度圈，只打日志
             Serial.print("  分批发送：已发送 ");
             Serial.print(pointsSentThisCycle);
             Serial.print(" 个点，总计已发送 ");
@@ -1371,6 +1935,12 @@ void sendHeartbeat()
     heartbeatMsg.senderUptime = millis();
     heartbeatMsg.senderOffset = relativeBootTimeOffset;
     memset(&heartbeatMsg.touch_data, 0, sizeof(TouchData_t));
+    // 电量塞进 touch_data.x（0-100），供在线列表显示
+    extern float readBatteryVoltagePercentage();
+    int bat = (int)(readBatteryVoltagePercentage() + 0.5f);
+    if (bat < 0) bat = 0;
+    if (bat > 100) bat = 100;
+    heartbeatMsg.touch_data.x = bat;
     size_t pts = allDrawingHistory.size();
     heartbeatMsg.totalPointsForSync = (pts > 65535) ? 65535 : (uint16_t)pts;
     // 获取并添加内存信息
@@ -1459,10 +2029,8 @@ void sendChatEx(MessageType_t type, uint8_t mode, const char *targetId, const ch
     }
     pkt.timestamp = millis();
 
-    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&pkt, sizeof(pkt));
-    if (result != ESP_OK) {
-        Serial.print("发送聊天包失败: ");
-        Serial.println(esp_err_to_name(result));
+    if (!transportSend((const uint8_t *)&pkt, sizeof(pkt), nullptr)) {
+        Serial.println("发送聊天包失败(全通道)");
     }
 }
 

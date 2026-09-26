@@ -7,6 +7,7 @@
 #include <algorithm>  // 包含 algorithm 库，用于 min/max 函数
 #include "drawing_history.h" // 包含自定义绘图历史头文件
 #include "esp_now_handler.h" // 包含 esp_now_handler.h 以访问 PeerInfo_t 和 peerInfoMap
+#include "transport_manager.h"
 #include <esp_wifi.h> // 用于获取本机 MAC 地址
 #include "SD.h"       // 包含 SD 卡库
 #include "FS.h"        // 包含文件系统库
@@ -61,6 +62,19 @@ static bool nameEditFingerDown = false;
 static size_t signalPeerRotateIndex = 0;
 static unsigned long lastSignalPeerRotateTime = 0;
 static String signalFocusMac;
+
+// 画板在线列表 / 私聊邀请
+static int onlineListScrollY = 0;
+static int onlineListPressX = 0;
+static int onlineListPressY = 0;
+static int onlineListDragLastY = -1;
+static bool onlineListDragging = false;
+static bool onlineListFingerDown = false;
+static bool privInviteVisible = false;
+static char privInviteFromId[DEVICE_ID_MAX_LEN + 1] = {0};
+static unsigned long privInviteDeadlineMs = 0;
+static unsigned long privInviteLastDrawnSec = 0;
+static bool privInviteFingerDown = false;
 
 // 进度条状态变量定义
 int sendProgressTotal = 0;
@@ -123,6 +137,7 @@ void drawMainInterface()
         }
         // C/D 已移除；仅保留左下角聊天入口
         drawChatJoinButton();
+        drawSettingsButton();
         if (showSendProgress)
         {
             drawSendProgressIndicator();
@@ -149,6 +164,8 @@ void redrawMainScreen()
         } else {
             replayAllDrawings(); // 否则重绘历史笔迹
         }
+        if (privInviteVisible)
+            drawPrivInviteDialog();
     } else if (currentUIState == UI_STATE_COLOR_PICKER) {
         drawColorSelectors();
     } else if (currentUIState == UI_STATE_PEER_INFO) {
@@ -157,6 +174,10 @@ void redrawMainScreen()
         drawNameEditScreen();
     } else if (currentUIState == UI_STATE_CHAT) {
         drawChatRoom();
+    } else if (currentUIState == UI_STATE_ONLINE_LIST) {
+        drawOnlineListScreen();
+    } else if (currentUIState == UI_STATE_SETTINGS) {
+        drawSettingsScreen();
     } else if (currentUIState == UI_STATE_POPUP) {
         drawMainInterface();
         replayAllDrawings();
@@ -166,6 +187,8 @@ void redrawMainScreen()
             showCoffeePopup();
         else if (isProjectInfoPopupVisible)
             showProjectInfoPopup();
+        if (isPrivInviteDialogVisible())
+            drawPrivInviteDialog();
     }
 }
 
@@ -189,7 +212,13 @@ void redrawMainScreenWithoutMessage()
         drawNameEditScreen();
     } else if (currentUIState == UI_STATE_CHAT) {
         drawChatRoom();
+    } else if (currentUIState == UI_STATE_ONLINE_LIST) {
+        drawOnlineListScreen();
+    } else if (currentUIState == UI_STATE_SETTINGS) {
+        drawSettingsScreen();
     }
+    if (privInviteVisible)
+        drawPrivInviteDialog();
 }
 
 void drawResetButton()
@@ -831,7 +860,12 @@ void updateCurrentColor(uint32_t newColor)
 void updateConnectedDevicesCount()
 {
     char deviceCountBuffer[10];
-    sprintf(deviceCountBuffer, "%d", peerInfoMap.size()); // 使用 peerInfoMap 的大小
+    size_t n = 0;
+    for (auto const &kv : peerInfoMap) {
+        if (peerVisibleForLocalMode(kv.second))
+            n++;
+    }
+    sprintf(deviceCountBuffer, "%d", (int)n);
 
     tft.fillRect(PEER_INFO_BUTTON_X, PEER_INFO_BUTTON_Y, PEER_INFO_BUTTON_W, PEER_INFO_BUTTON_H, TFT_BLUE);
     tft.setTextColor(TFT_WHITE, TFT_BLUE);
@@ -1958,6 +1992,37 @@ static void drawRssiBars(int x, int y, int8_t rssi)
     }
 }
 
+// Simple WiFi icon (chevron arcs + dot)
+static void drawWifiIcon(int x, int y, int8_t rssi)
+{
+    int level = 0;
+    if (rssi == 0)
+        level = 0;
+    else if (rssi >= -55)
+        level = 3;
+    else if (rssi >= -70)
+        level = 2;
+    else if (rssi >= -85)
+        level = 1;
+    else
+        level = 0;
+    uint16_t onC = (level == 0) ? TFT_RED : ((level == 1) ? TFT_YELLOW : TFT_CYAN);
+    uint16_t offC = TFT_DARKGREY;
+    int cx = x + 10;
+    int cy = y + 14;
+    tft.fillCircle(cx, cy, 2, onC);
+    auto chev = [&](int w, int top, bool on) {
+        uint16_t c = on ? onC : offC;
+        tft.drawLine(cx - w, top + w / 2, cx, top, c);
+        tft.drawLine(cx, top, cx + w, top + w / 2, c);
+        tft.drawLine(cx - w, top + w / 2 + 1, cx, top + 1, c);
+        tft.drawLine(cx, top + 1, cx + w, top + w / 2 + 1, c);
+    };
+    chev(4, y + 10, level >= 1);
+    chev(7, y + 6, level >= 2);
+    chev(10, y + 2, level >= 3);
+}
+
 void paintCurrentCanvasPage()
 {
     if (currentUIState != UI_STATE_MAIN || inCustomColorMode) {
@@ -2017,6 +2082,15 @@ void drawCanvasPageButtons()
     if (currentUIState != UI_STATE_MAIN || inCustomColorMode)
         return;
     tft.setTextDatum(MC_DATUM);
+    // 退出私聊（翻左侧，仅私聊激活时显示）
+    if (isPrivateCanvasActive()) {
+        tft.fillRect(CANVAS_EXIT_PRIV_X, CANVAS_PAGE_BTN_Y, CANVAS_PAGE_BTN_W, CANVAS_PAGE_BTN_H,
+                     tft.color565(160, 50, 50));
+        cnDrawUtf8(tft, CANVAS_EXIT_PRIV_X + (CANVAS_PAGE_BTN_W - cnTextWidth("退")) / 2,
+                   CANVAS_PAGE_BTN_Y + 1, "退", TFT_WHITE);
+    } else {
+        tft.fillRect(CANVAS_EXIT_PRIV_X, CANVAS_PAGE_BTN_Y, CANVAS_PAGE_BTN_W, CANVAS_PAGE_BTN_H, TFT_BLACK);
+    }
     // 屏幕翻转（C 左侧）
     tft.fillRect(CANVAS_FLIP_X, CANVAS_PAGE_BTN_Y, CANVAS_PAGE_BTN_W, CANVAS_PAGE_BTN_H,
                  screenRotation == SCREEN_ROT_FLIPPED ? tft.color565(40, 120, 90)
@@ -2081,6 +2155,21 @@ bool isCanvasFlipPressed(int x, int y)
         return false;
     return x >= CANVAS_FLIP_X && x <= CANVAS_FLIP_X + CANVAS_PAGE_BTN_W &&
            y >= CANVAS_PAGE_BTN_Y && y <= CANVAS_PAGE_BTN_Y + CANVAS_PAGE_BTN_H;
+}
+
+bool isCanvasExitPrivPressed(int x, int y)
+{
+    if (currentUIState != UI_STATE_MAIN || inCustomColorMode)
+        return false;
+    if (!isPrivateCanvasActive())
+        return false;
+    return x >= CANVAS_EXIT_PRIV_X && x <= CANVAS_EXIT_PRIV_X + CANVAS_PAGE_BTN_W &&
+           y >= CANVAS_PAGE_BTN_Y && y <= CANVAS_PAGE_BTN_Y + CANVAS_PAGE_BTN_H;
+}
+
+void handleCanvasExitPriv()
+{
+    leavePrivateCanvas();
 }
 
 uint8_t getScreenRotation()
@@ -2251,7 +2340,7 @@ void drawSignalStrengthInfo()
 {
     if (currentUIState != UI_STATE_MAIN || inCustomColorMode)
         return;
-    if (isProjectInfoPopupVisible || isCoffeePopupVisible)
+    if (isProjectInfoPopupVisible || isCoffeePopupVisible || isClearConfirmVisible || privInviteVisible)
         return;
 
     tft.fillRect(SIGNAL_INFO_X, SIGNAL_INFO_Y, SIGNAL_INFO_W, SIGNAL_INFO_H, TFT_BLACK);
@@ -2261,20 +2350,39 @@ void drawSignalStrengthInfo()
         tft.setTextDatum(TL_DATUM);
         tft.setTextFont(1);
         tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y);
-        tft.print("Sig");
-        tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 10);
-        tft.print("--");
+        if (transportUsesWifiIcon() || linkModeWifiEnabled()) {
+            tft.print("WiFi");
+            drawWifiIcon(SIGNAL_INFO_X + 2, SIGNAL_INFO_Y + 8, 0);
+        } else {
+            tft.print("Sig");
+            tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 10);
+            tft.print("tap");
+        }
         return;
     }
 
-    // 收集在线对端 (按 MAC 稳定排序感：用 map 自身顺序)
+    // 收集对本机可见的对端
     std::vector<String> peerMacs;
     peerMacs.reserve(peerInfoMap.size());
     for (auto const &kv : peerInfoMap) {
-        peerMacs.push_back(kv.first);
+        if (peerVisibleForLocalMode(kv.second))
+            peerMacs.push_back(kv.first);
     }
-    if (peerMacs.empty())
+    if (peerMacs.empty()) {
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextFont(1);
+        tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y);
+        if (linkModeIsWifiOnly()) {
+            tft.print("WiFi");
+            drawWifiIcon(SIGNAL_INFO_X + 2, SIGNAL_INFO_Y + 8, 0);
+        } else {
+            tft.print("Sig");
+            tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 10);
+            tft.print("tap");
+        }
         return;
+    }
 
     // 定位当前关注的 MAC
     size_t cur = 0;
@@ -2331,17 +2439,38 @@ void drawSignalStrengthInfo()
     tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y);
     // 标识过长则截断
     char idShort[7];
-    strncpy(idShort, id, 6);
-    idShort[6] = '\0';
+    if (isPrivateCanvasActive()) {
+        strncpy(idShort, "PRIV", 6);
+        idShort[6] = '\0';
+        tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
+    } else {
+        strncpy(idShort, id, 6);
+        idShort[6] = '\0';
+    }
     tft.print(idShort);
 
-    // 信号条（替代 dBm 数字）
-    drawRssiBars(SIGNAL_INFO_X + 2, SIGNAL_INFO_Y + 10, rssi);
+    // ESP-NOW → signal bars；WiFi/双并发 → WiFi 图标
+    if (transportUsesWifiIcon())
+        drawWifiIcon(SIGNAL_INFO_X + 2, SIGNAL_INFO_Y + 8, rssi);
+    else
+        drawRssiBars(SIGNAL_INFO_X + 2, SIGNAL_INFO_Y + 10, rssi);
 
-    if (peerMacs.size() > 1) {
+    if (peerMacs.size() > 1 && !isPrivateCanvasActive()) {
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
         tft.printf("%u/%u", (unsigned)(cur + 1), (unsigned)peerMacs.size());
+    } else if (isPrivateCanvasActive()) {
+        tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
+        tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
+        tft.print("tap");
+    } else if (transportUsesWifiIcon()) {
+        tft.setTextColor(TFT_CYAN, TFT_DARKGREY);
+        tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
+        tft.print("WiFi");
+    } else {
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
+        tft.print("ESP");
     }
 }
 
@@ -2595,9 +2724,9 @@ bool eraserOverlapsUi(int cx, int cy, int r)
         circleHitsRect(cx, cy, r, SCREENSHOT_BUTTON_X - 2, SCREENSHOT_BUTTON_Y - 2,
                        SCREENSHOT_BUTTON_W + 4, SCREENSHOT_BUTTON_H + 4))
         return true;
-    // 画布翻页 / 清页 / 翻转按钮（翻 C < >）
-    if (circleHitsRect(cx, cy, r, CANVAS_FLIP_X - 2, CANVAS_PAGE_BTN_Y - 2,
-                       CANVAS_PAGE_BTN_W * 4 + 10, CANVAS_PAGE_BTN_H + 4))
+    // 画布翻页 / 清页 / 翻转 / 退出私聊（退 翻 C < >）
+    if (circleHitsRect(cx, cy, r, CANVAS_EXIT_PRIV_X - 2, CANVAS_PAGE_BTN_Y - 2,
+                       CANVAS_PAGE_BTN_W * 5 + 12, CANVAS_PAGE_BTN_H + 4))
         return true;
     // 橡皮擦滑块 / +/-
     if (isEraserSliderVisible) {
@@ -2749,6 +2878,7 @@ void redrawUiChrome()
     drawCanvasPageButtons();
     drawSignalStrengthInfo();
     drawChatJoinButton();
+    drawSettingsButton();
     if (isDebugInfoVisible) {
         drawDebugInfo();
         drawInfoButton();
@@ -2891,9 +3021,14 @@ void updateStatusOverlays()
         line[sizeof(line) - 1] = 0;
         color = TFT_CYAN;
     } else {
+        size_t n = 0;
+        for (auto const &kv : peerInfoMap) {
+            if (peerVisibleForLocalMode(kv.second))
+                n++;
+        }
         snprintf(line, sizeof(line), "%s ·%u ·%u/%u ·b%d",
                  localDeviceId,
-                 (unsigned)peerInfoMap.size(),
+                 (unsigned)n,
                  (unsigned)(currentCanvasPage + 1),
                  (unsigned)canvasPageCount,
                  brushRadius);
@@ -3948,6 +4083,8 @@ static void drawPrivatePeerList()
     int y = CHAT_TAB_H + 22;
     int i = 0;
     for (auto const &kv : peerInfoMap) {
+        if (!peerVisibleForLocalMode(kv.second))
+            continue;
         if (i >= 8) break;
         const PeerInfo_t &p = kv.second;
         const char *id = p.deviceId[0] ? p.deviceId : p.macAddress.c_str();
@@ -3957,7 +4094,7 @@ static void drawPrivatePeerList()
         y += 22;
         i++;
     }
-    if (peerInfoMap.empty())
+    if (i == 0)
         cnDrawUtf8(tft, 14, 80, "暂无在线好友", TFT_DARKGREY);
     // 底部返回
     tft.fillRoundRect(SCREEN_WIDTH / 2 - 40, SCREEN_HEIGHT - 24, 80, 20, 3, TFT_DARKGREY);
@@ -3977,6 +4114,8 @@ static void drawOnlinePanel()
     unsigned long now = millis();
 
     for (auto const &kv : peerInfoMap) {
+        if (!peerVisibleForLocalMode(kv.second))
+            continue;
         if (shown >= 7)
             break;
         const PeerInfo_t &p = kv.second;
@@ -4009,7 +4148,7 @@ static void drawOnlinePanel()
         y += rowH;
         shown++;
     }
-    if (peerInfoMap.empty())
+    if (shown == 0)
         cnDrawUtf8(tft, 14, 90, "暂无在线好友", TFT_DARKGREY);
 
     tft.fillRoundRect(SCREEN_WIDTH / 2 - 40, SCREEN_HEIGHT - 24, 80, 20, 3, TFT_DARKGREY);
@@ -4033,6 +4172,8 @@ static void drawGroupInvitePick()
     int y = CHAT_TAB_H + 22;
     int i = 0;
     for (auto const &kv : peerInfoMap) {
+        if (!peerVisibleForLocalMode(kv.second))
+            continue;
         if (i >= 8)
             break;
         const PeerInfo_t &p = kv.second;
@@ -4043,7 +4184,7 @@ static void drawGroupInvitePick()
         y += 22;
         i++;
     }
-    if (peerInfoMap.empty())
+    if (i == 0)
         cnDrawUtf8(tft, 14, 80, "暂无在线好友", TFT_DARKGREY);
     tft.fillRoundRect(SCREEN_WIDTH / 2 - 40, SCREEN_HEIGHT - 24, 80, 20, 3, TFT_DARKGREY);
     cnDrawUtf8(tft, SCREEN_WIDTH / 2 - 16, SCREEN_HEIGHT - 20, "取消", TFT_WHITE);
@@ -4508,6 +4649,8 @@ bool handleChatTouch(int x, int y)
         if (idx >= 0) {
             int i = 0;
             for (auto const &kv : peerInfoMap) {
+                if (!peerVisibleForLocalMode(kv.second))
+                    continue;
                 if (i == idx) {
                     strncpy(privatePeerId, kv.second.deviceId[0] ? kv.second.deviceId : kv.first.c_str(), DEVICE_ID_MAX_LEN);
                     privatePeerId[DEVICE_ID_MAX_LEN] = 0;
@@ -4542,6 +4685,8 @@ bool handleChatTouch(int x, int y)
             if (idx >= 0) {
                 int i = 0;
                 for (auto const &kv : peerInfoMap) {
+                    if (!peerVisibleForLocalMode(kv.second))
+                        continue;
                     if (i == idx) {
                         int gi = findGroupIndexById(inviteGroupId);
                         if (gi >= 0 && isGroupOwner(chatGroups[gi])) {
@@ -4735,3 +4880,803 @@ bool handleChatTouch(int x, int y)
 // 然而，它更像是一个系统工具或电源管理功能。
 // 目前，它是 extern 声明的，假设它在 Project-ESPNow.ino 或 power_manager 中。
 // float readBatteryVoltagePercentage() { /* ... 实现 ... */ }
+
+// ========== 画板在线列表 / 私聊邀请 ==========
+
+bool isSignalInfoPressed(int x, int y)
+{
+    if (currentUIState != UI_STATE_MAIN || inCustomColorMode)
+        return false;
+    return x >= SIGNAL_INFO_X - 2 && x <= SIGNAL_INFO_X + SIGNAL_INFO_W + 4 &&
+           y >= SIGNAL_INFO_Y - 2 && y <= SIGNAL_INFO_Y + SIGNAL_INFO_H + 4;
+}
+
+static void formatOnlineDuration(unsigned long firstSeenMs, char *out, size_t outLen)
+{
+    if (!out || outLen < 4) return;
+    if (firstSeenMs == 0) {
+        snprintf(out, outLen, "--");
+        return;
+    }
+    unsigned long sec = (millis() - firstSeenMs) / 1000UL;
+    if (sec < 60)
+        snprintf(out, outLen, "%lus", sec);
+    else if (sec < 3600)
+        snprintf(out, outLen, "%lum", sec / 60);
+    else
+        snprintf(out, outLen, "%luh", sec / 3600);
+}
+
+static int onlineListContentHeight()
+{
+    int n = 0;
+    for (auto const &kv : peerInfoMap) {
+        if (peerVisibleForLocalMode(kv.second))
+            n++;
+    }
+    if (n < 1) n = 1;
+    return n * ONLINE_LIST_ROW_H;
+}
+
+static void clampOnlineListScroll()
+{
+    int viewH = ONLINE_LIST_BOTTOM - ONLINE_LIST_TOP - ONLINE_LIST_HEADER_H;
+    int maxScroll = onlineListContentHeight() - viewH;
+    if (maxScroll < 0) maxScroll = 0;
+    if (onlineListScrollY < 0) onlineListScrollY = 0;
+    if (onlineListScrollY > maxScroll) onlineListScrollY = maxScroll;
+}
+
+void drawOnlineListScreen()
+{
+    tft.fillScreen(tft.color565(12, 14, 22));
+    tft.fillRect(0, 0, SCREEN_WIDTH, 26, tft.color565(28, 36, 55));
+    cnDrawUtf8(tft, 8, 7, "在线设备", TFT_WHITE);
+    tft.fillRoundRect(SCREEN_WIDTH - 56, 4, 50, 18, 3, tft.color565(60, 70, 90));
+    cnDrawUtf8(tft, SCREEN_WIDTH - 44, 7, "返回", TFT_CYAN);
+
+    // 表头
+    int hy = ONLINE_LIST_TOP;
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(1);
+    cnDrawUtf8(tft, 6, hy + 3, "ID", TFT_LIGHTGREY);
+    cnDrawUtf8(tft, 48, hy + 3, "信号", TFT_LIGHTGREY);
+    cnDrawUtf8(tft, 94, hy + 3, "延迟", TFT_LIGHTGREY);
+    cnDrawUtf8(tft, 140, hy + 3, "电量", TFT_LIGHTGREY);
+    cnDrawUtf8(tft, 184, hy + 3, "上线", TFT_LIGHTGREY);
+    cnDrawUtf8(tft, 248, hy + 3, "操作", TFT_LIGHTGREY);
+    tft.drawFastHLine(4, hy + ONLINE_LIST_HEADER_H - 2, SCREEN_WIDTH - 8, TFT_DARKGREY);
+
+    clampOnlineListScroll();
+    int listTop = ONLINE_LIST_TOP + ONLINE_LIST_HEADER_H;
+    int viewH = ONLINE_LIST_BOTTOM - listTop;
+    tft.fillRect(0, listTop, SCREEN_WIDTH, viewH, tft.color565(12, 14, 22));
+
+    int visibleN = 0;
+    for (auto const &kv : peerInfoMap) {
+        if (peerVisibleForLocalMode(kv.second))
+            visibleN++;
+    }
+    if (visibleN == 0) {
+        cnDrawUtf8(tft, 24, listTop + 40, "暂无在线设备", TFT_DARKGREY);
+        if (privInviteVisible)
+            drawPrivInviteDialog();
+        return;
+    }
+
+    unsigned long now = millis();
+    int idx = 0;
+    for (auto const &kv : peerInfoMap) {
+        const PeerInfo_t &p = kv.second;
+        if (!peerVisibleForLocalMode(p))
+            continue;
+        int rowY = listTop + idx * ONLINE_LIST_ROW_H - onlineListScrollY;
+        idx++;
+        if (rowY + ONLINE_LIST_ROW_H < listTop)
+            continue;
+        if (rowY > ONLINE_LIST_BOTTOM)
+            break;
+
+        const char *id = p.deviceId[0] ? p.deviceId : "Peer";
+        uint16_t rowBg = (idx & 1) ? tft.color565(22, 28, 42) : tft.color565(18, 22, 34);
+        int drawY = rowY;
+        int clipH = ONLINE_LIST_ROW_H - 2;
+        if (drawY < listTop) {
+            clipH -= (listTop - drawY);
+            drawY = listTop;
+        }
+        if (drawY + clipH > ONLINE_LIST_BOTTOM)
+            clipH = ONLINE_LIST_BOTTOM - drawY;
+        if (clipH <= 0)
+            continue;
+
+        tft.fillRoundRect(4, drawY, SCREEN_WIDTH - 8, clipH, 2, rowBg);
+
+        // 仅当整行大致可见时画文字
+        if (rowY >= listTop - 4 && rowY + 16 <= ONLINE_LIST_BOTTOM) {
+            char idShort[8];
+            strncpy(idShort, id, 7);
+            idShort[7] = '\0';
+            tft.setTextColor(TFT_WHITE, rowBg);
+            tft.drawString(idShort, 6, rowY + 6, 1);
+
+            drawRssiBars(54, rowY + 8, p.rssi);
+
+            unsigned long lat = p.latencyMs;
+            if (p.lastSeenMs > 0 && now >= p.lastSeenMs) {
+                unsigned long age = now - p.lastSeenMs;
+                if (age > lat) lat = age;
+            }
+            if (lat > 9999) lat = 9999;
+            char latBuf[12];
+            snprintf(latBuf, sizeof(latBuf), "%lu", lat);
+            uint16_t latColor = TFT_CYAN;
+            if (lat > 4000) latColor = TFT_RED;
+            else if (lat > 2000) latColor = TFT_YELLOW;
+            tft.setTextColor(latColor, rowBg);
+            tft.drawString(latBuf, 100, rowY + 6, 1);
+
+            char batBuf[8];
+            if (p.batteryPercent > 0)
+                snprintf(batBuf, sizeof(batBuf), "%u%%", (unsigned)p.batteryPercent);
+            else
+                snprintf(batBuf, sizeof(batBuf), "--");
+            tft.setTextColor(TFT_GREENYELLOW, rowBg);
+            tft.drawString(batBuf, 148, rowY + 6, 1);
+
+            char upBuf[10];
+            formatOnlineDuration(p.firstSeenMs, upBuf, sizeof(upBuf));
+            tft.setTextColor(TFT_LIGHTGREY, rowBg);
+            tft.drawString(upBuf, 190, rowY + 6, 1);
+
+            bool busy = isPrivateCanvasActive() || isPrivateCanvasInvitePending();
+            uint16_t btnC = busy ? tft.color565(70, 70, 80) : tft.color565(40, 110, 90);
+            tft.fillRoundRect(SCREEN_WIDTH - ONLINE_LIST_BTN_W - 8, rowY + 8,
+                              ONLINE_LIST_BTN_W, ONLINE_LIST_BTN_H, 3, btnC);
+            cnDrawUtf8(tft, SCREEN_WIDTH - ONLINE_LIST_BTN_W - 2, rowY + 11,
+                       "私聊", busy ? TFT_DARKGREY : TFT_WHITE);
+        }
+    }
+    if (privInviteVisible)
+        drawPrivInviteDialog();
+}
+
+void updateOnlineListScreen()
+{
+    if (currentUIState != UI_STATE_ONLINE_LIST)
+        return;
+    drawOnlineListScreen();
+}
+
+void showOnlineListScreen()
+{
+    if (!isScreenOn || inCustomColorMode)
+        return;
+    onlineListScrollY = 0;
+    onlineListDragging = false;
+    onlineListDragLastY = -1;
+    onlineListFingerDown = false;
+    currentUIState = UI_STATE_ONLINE_LIST;
+    drawOnlineListScreen();
+}
+
+void hideOnlineListScreen()
+{
+    if (currentUIState != UI_STATE_ONLINE_LIST)
+        return;
+    currentUIState = UI_STATE_MAIN;
+    redrawMainScreen();
+}
+
+void onlineListTouchReleased()
+{
+    if (onlineListFingerDown && !onlineListDragging) {
+        int x = onlineListPressX;
+        int y = onlineListPressY;
+        if (y <= 26 && x >= SCREEN_WIDTH - 60) {
+            hideOnlineListScreen();
+        } else {
+            int listTop = ONLINE_LIST_TOP + ONLINE_LIST_HEADER_H;
+            int idx = 0;
+            for (auto const &kv : peerInfoMap) {
+                if (!peerVisibleForLocalMode(kv.second))
+                    continue;
+                int rowY = listTop + idx * ONLINE_LIST_ROW_H - onlineListScrollY;
+                idx++;
+                int btnX = SCREEN_WIDTH - ONLINE_LIST_BTN_W - 8;
+                int btnY = rowY + 8;
+                if (x >= btnX && x <= btnX + ONLINE_LIST_BTN_W &&
+                    y >= btnY && y <= btnY + ONLINE_LIST_BTN_H &&
+                    rowY >= listTop - 4 && rowY + ONLINE_LIST_ROW_H <= ONLINE_LIST_BOTTOM + 4) {
+                    if (isPrivateCanvasActive() || isPrivateCanvasInvitePending()) {
+                        showStatusToast("已在私聊流程中", 1500);
+                        break;
+                    }
+                    const PeerInfo_t &p = kv.second;
+                    const char *id = p.deviceId[0] ? p.deviceId : "Peer";
+                    invitePrivateCanvas(id, p.macAddress);
+                    hideOnlineListScreen();
+                    break;
+                }
+            }
+        }
+    }
+    onlineListFingerDown = false;
+    onlineListDragging = false;
+    onlineListDragLastY = -1;
+}
+
+bool handleOnlineListTouch(int x, int y)
+{
+    if (currentUIState != UI_STATE_ONLINE_LIST)
+        return false;
+
+    if (!onlineListFingerDown) {
+        onlineListFingerDown = true;
+        onlineListDragging = false;
+        onlineListPressX = x;
+        onlineListPressY = y;
+        onlineListDragLastY = y;
+        return true;
+    }
+
+    if (abs(y - onlineListPressY) > 6 || abs(x - onlineListPressX) > 6)
+        onlineListDragging = true;
+
+    int listTop = ONLINE_LIST_TOP + ONLINE_LIST_HEADER_H;
+    if (onlineListDragging && onlineListDragLastY >= 0) {
+        int dy = onlineListDragLastY - y;
+        if (abs(dy) > 1) {
+            onlineListScrollY += dy;
+            clampOnlineListScroll();
+            drawOnlineListScreen();
+        }
+    }
+    onlineListDragLastY = y;
+    return true;
+}
+
+void showPrivInviteDialog(const char *fromId, unsigned long deadlineMs)
+{
+    strncpy(privInviteFromId, fromId ? fromId : "Peer", DEVICE_ID_MAX_LEN);
+    privInviteFromId[DEVICE_ID_MAX_LEN] = '\0';
+    privInviteDeadlineMs = deadlineMs;
+    privInviteVisible = true;
+    privInviteFingerDown = false;
+    privInviteLastDrawnSec = 0;
+    if (!isScreenOn)
+        setScreenPower(true);
+    // 非主界面/在线列表时回主界面，保证弹窗可见
+    if (currentUIState != UI_STATE_MAIN && currentUIState != UI_STATE_ONLINE_LIST) {
+        currentUIState = UI_STATE_MAIN;
+        redrawMainScreen();
+        return; // redrawMainScreen 末尾会再画邀请框
+    }
+    drawPrivInviteDialog();
+}
+
+void hidePrivInviteDialog()
+{
+    if (!privInviteVisible)
+        return;
+    privInviteVisible = false;
+    privInviteFingerDown = false;
+    if (currentUIState == UI_STATE_MAIN)
+        redrawMainScreen();
+    else if (currentUIState == UI_STATE_ONLINE_LIST)
+        drawOnlineListScreen();
+}
+
+bool isPrivInviteDialogVisible()
+{
+    return privInviteVisible;
+}
+
+void drawPrivInviteDialog()
+{
+    if (!privInviteVisible || !isScreenOn)
+        return;
+    long remain = (long)(privInviteDeadlineMs - millis());
+    if (remain < 0) remain = 0;
+    unsigned long sec = (unsigned long)(remain / 1000UL);
+
+    const uint16_t panelBg = tft.color565(30, 36, 55);
+    const uint16_t rejectBg = tft.color565(90, 50, 50);
+    const uint16_t acceptBg = tft.color565(40, 120, 80);
+
+    tft.fillRoundRect(PRIV_INVITE_POPUP_X, PRIV_INVITE_POPUP_Y,
+                      PRIV_INVITE_POPUP_W, PRIV_INVITE_POPUP_H, 6, panelBg);
+    tft.drawRoundRect(PRIV_INVITE_POPUP_X, PRIV_INVITE_POPUP_Y,
+                      PRIV_INVITE_POPUP_W, PRIV_INVITE_POPUP_H, 6, TFT_CYAN);
+    tft.drawRoundRect(PRIV_INVITE_POPUP_X + 1, PRIV_INVITE_POPUP_Y + 1,
+                      PRIV_INVITE_POPUP_W - 2, PRIV_INVITE_POPUP_H - 2, 5,
+                      tft.color565(80, 160, 200));
+
+    char title[40];
+    snprintf(title, sizeof(title), "%s 邀请私聊画板", privInviteFromId);
+    int tw = cnTextWidth(title);
+    cnDrawUtf8(tft, PRIV_INVITE_POPUP_X + (PRIV_INVITE_POPUP_W - tw) / 2,
+               PRIV_INVITE_POPUP_Y + 12, title, TFT_WHITE, panelBg, false);
+
+    char tip[28];
+    snprintf(tip, sizeof(tip), "%lus 请选择", sec);
+    int tipW = cnTextWidth(tip);
+    cnDrawUtf8(tft, PRIV_INVITE_POPUP_X + (PRIV_INVITE_POPUP_W - tipW) / 2,
+               PRIV_INVITE_POPUP_Y + 32, tip, TFT_YELLOW, panelBg, false);
+
+    int btnY = PRIV_INVITE_POPUP_Y + PRIV_INVITE_POPUP_H - 34;
+    int rejectX = PRIV_INVITE_POPUP_X + 16;
+    int acceptX = PRIV_INVITE_POPUP_X + PRIV_INVITE_POPUP_W - CONFIRM_BTN_W - 16;
+    tft.fillRoundRect(rejectX, btnY, CONFIRM_BTN_W, CONFIRM_BTN_H, 4, rejectBg);
+    tft.fillRoundRect(acceptX, btnY, CONFIRM_BTN_W, CONFIRM_BTN_H, 4, acceptBg);
+    cnDrawUtf8(tft, rejectX + (CONFIRM_BTN_W - cnTextWidth("拒绝")) / 2, btnY + 8,
+               "拒绝", TFT_WHITE, rejectBg, false);
+    cnDrawUtf8(tft, acceptX + (CONFIRM_BTN_W - cnTextWidth("同意")) / 2, btnY + 8,
+               "同意", TFT_WHITE, acceptBg, false);
+    privInviteLastDrawnSec = sec;
+}
+
+void updatePrivInviteDialog()
+{
+    if (!privInviteVisible)
+        return;
+    long remain = (long)(privInviteDeadlineMs - millis());
+    if (remain < 0) remain = 0;
+    unsigned long sec = (unsigned long)(remain / 1000UL);
+    if (sec != privInviteLastDrawnSec)
+        drawPrivInviteDialog();
+}
+
+bool handlePrivInviteTouch(int x, int y)
+{
+    if (!privInviteVisible)
+        return false;
+    if (privInviteFingerDown)
+        return true;
+    int btnY = PRIV_INVITE_POPUP_Y + PRIV_INVITE_POPUP_H - 34;
+    int rejectX = PRIV_INVITE_POPUP_X + 16;
+    int acceptX = PRIV_INVITE_POPUP_X + PRIV_INVITE_POPUP_W - CONFIRM_BTN_W - 16;
+    if (y >= btnY && y <= btnY + CONFIRM_BTN_H) {
+        if (x >= rejectX && x <= rejectX + CONFIRM_BTN_W) {
+            privInviteFingerDown = true;
+            rejectPrivateCanvasInvite();
+            return true;
+        }
+        if (x >= acceptX && x <= acceptX + CONFIRM_BTN_W) {
+            privInviteFingerDown = true;
+            acceptPrivateCanvasInvite();
+            return true;
+        }
+    }
+    // 点在弹窗外忽略（必须点按钮）
+    return true;
+}
+
+void onPrivateCanvasSessionChanged()
+{
+    if (currentUIState == UI_STATE_MAIN && !inCustomColorMode)
+        drawCanvasPageButtons();
+    else if (currentUIState == UI_STATE_ONLINE_LIST)
+        drawOnlineListScreen();
+    // 在线列表会 fillScreen，必须把邀请弹窗叠回去
+    if (privInviteVisible)
+        drawPrivInviteDialog();
+}
+
+// ========== 设置：WiFi / 传输 ==========
+
+enum SettingsPage_e {
+    SETTINGS_PAGE_HOME = 0,
+    SETTINGS_PAGE_WIFI_LIST,
+    SETTINGS_PAGE_WIFI_PASS
+};
+
+static int settingsPage = SETTINGS_PAGE_HOME;
+static int settingsWifiScroll = 0;
+static int settingsSelectedAp = -1;
+static char settingsPassBuf[WIFI_PASS_MAX + 1] = {0};
+static bool settingsFingerDown = false;
+static bool settingsPassCaps = false;
+static int settingsDragLastY = -1;
+static bool settingsDragging = false;
+static int settingsPressX = 0, settingsPressY = 0;
+static bool settingsNeedRedraw = true;
+static bool settingsWasConnecting = false;
+
+void drawSettingsButton()
+{
+    if (!isScreenOn || inCustomColorMode || currentUIState != UI_STATE_MAIN)
+        return;
+    tft.fillRect(SETTINGS_BUTTON_X, SETTINGS_BUTTON_Y, SETTINGS_BUTTON_W, SETTINGS_BUTTON_H,
+                 tft.color565(40, 90, 120));
+    cnDrawUtf8(tft, SETTINGS_BUTTON_X + 2, SETTINGS_BUTTON_Y + 2, "设", TFT_WHITE);
+}
+
+bool isSettingsButtonPressed(int x, int y)
+{
+    if (currentUIState != UI_STATE_MAIN)
+        return false;
+    return x >= SETTINGS_BUTTON_X && x <= SETTINGS_BUTTON_X + SETTINGS_BUTTON_W &&
+           y >= SETTINGS_BUTTON_Y && y <= SETTINGS_BUTTON_Y + SETTINGS_BUTTON_H;
+}
+
+static void drawSettingsPassKeyboard()
+{
+    const int keyH = 22;
+    const int keyW = 28;
+    const int startY = 118;
+    const char *rows[] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"};
+    for (int r = 0; r < 4; r++) {
+        int len = (int)strlen(rows[r]);
+        int totalW = len * (keyW + 1);
+        int startX = (SCREEN_WIDTH - totalW) / 2;
+        int ky = startY + r * (keyH + 1);
+        for (int i = 0; i < len; i++) {
+            int kx = startX + i * (keyW + 1);
+            tft.fillRoundRect(kx, ky, keyW, keyH, 2, tft.color565(50, 55, 70));
+            char ch = rows[r][i];
+            if (ch >= 'A' && ch <= 'Z' && !settingsPassCaps)
+                ch = (char)(ch - 'A' + 'a');
+            char s[2] = {ch, 0};
+            tft.setTextColor(TFT_WHITE, tft.color565(50, 55, 70));
+            tft.setTextDatum(MC_DATUM);
+            tft.drawString(s, kx + keyW / 2, ky + keyH / 2, 1);
+        }
+    }
+    // caps / del / space / ok
+    tft.fillRoundRect(8, SCREEN_HEIGHT - 26, 40, 22, 2, tft.color565(70, 80, 100));
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString(settingsPassCaps ? "ABC" : "abc", 28, SCREEN_HEIGHT - 15, 1);
+    tft.fillRoundRect(52, SCREEN_HEIGHT - 26, 50, 22, 2, tft.color565(90, 50, 50));
+    tft.drawString("DEL", 77, SCREEN_HEIGHT - 15, 1);
+    tft.fillRoundRect(106, SCREEN_HEIGHT - 26, 120, 22, 2, tft.color565(45, 50, 65));
+    tft.drawString("SPACE", 166, SCREEN_HEIGHT - 15, 1);
+    tft.fillRoundRect(230, SCREEN_HEIGHT - 26, 82, 22, 2, tft.color565(40, 120, 80));
+    cnDrawUtf8(tft, 250, SCREEN_HEIGHT - 22, "连接", TFT_WHITE);
+    tft.setTextDatum(TL_DATUM);
+}
+
+void drawSettingsScreen()
+{
+    tft.fillScreen(tft.color565(14, 16, 24));
+    tft.fillRect(0, 0, SCREEN_WIDTH, 24, tft.color565(28, 36, 55));
+    cnDrawUtf8(tft, 8, 6, "设置", TFT_WHITE);
+    tft.fillRoundRect(SCREEN_WIDTH - 56, 3, 50, 18, 3, tft.color565(60, 70, 90));
+    cnDrawUtf8(tft, SCREEN_WIDTH - 44, 6, "返回", TFT_CYAN);
+
+    if (settingsPage == SETTINGS_PAGE_HOME) {
+        cnDrawUtf8(tft, 8, 28, "传输模式", TFT_LIGHTGREY);
+        char line[48];
+        snprintf(line, sizeof(line), "%s", transportStatusLine());
+        tft.setTextColor(TFT_GREENYELLOW, tft.color565(14, 16, 24));
+        tft.setTextDatum(TL_DATUM);
+        tft.drawString(line, 8, 44, 1);
+
+        uint8_t mode = getLinkMode();
+        // 行1：仅 ESP-NOW | 启用 WiFi
+        tft.fillRoundRect(6, 62, 150, 26, 4,
+                          mode == LINK_MODE_ESPNOW_ONLY ? tft.color565(40, 130, 80)
+                                                        : tft.color565(40, 45, 60));
+        cnDrawUtf8(tft, 28, 70, "仅ESPNOW", TFT_WHITE);
+        tft.fillRoundRect(164, 62, 150, 26, 4,
+                          mode == LINK_MODE_WIFI_ON ? tft.color565(40, 100, 150)
+                                                    : tft.color565(40, 45, 60));
+        cnDrawUtf8(tft, 190, 70, "启用WiFi", TFT_WHITE);
+        // 行2：双并发 | 仅 WiFi
+        tft.fillRoundRect(6, 92, 150, 26, 4,
+                          mode == LINK_MODE_DUAL ? tft.color565(140, 90, 40)
+                                                 : tft.color565(40, 45, 60));
+        cnDrawUtf8(tft, 42, 100, "双并发", TFT_WHITE);
+        tft.fillRoundRect(164, 92, 150, 26, 4,
+                          mode == LINK_MODE_WIFI_ONLY ? tft.color565(50, 90, 160)
+                                                       : tft.color565(40, 45, 60));
+        cnDrawUtf8(tft, 200, 100, "仅WiFi", TFT_WHITE);
+
+        if (mode != LINK_MODE_ESPNOW_ONLY) {
+            if (wifiIsConnected()) {
+                char ip[40];
+                snprintf(ip, sizeof(ip), "IP %s", wifiLocalIp().toString().c_str());
+                tft.setTextColor(TFT_CYAN, tft.color565(14, 16, 24));
+                tft.drawString(ip, 8, 126, 1);
+            } else if (wifiConnectInProgress()) {
+                cnDrawUtf8(tft, 8, 126, "WiFi 连接中…", TFT_YELLOW);
+            } else if (wifiHasSavedCreds()) {
+                cnDrawUtf8(tft, 8, 126, "WiFi 未连接(有保存)", TFT_ORANGE);
+            } else {
+                cnDrawUtf8(tft, 8, 126, "请扫描并连接 WiFi", TFT_DARKGREY);
+            }
+
+            tft.fillRoundRect(8, 148, 140, 28, 4, tft.color565(40, 100, 140));
+            cnDrawUtf8(tft, 28, 156, "扫描 WiFi", TFT_WHITE);
+            tft.fillRoundRect(160, 148, 140, 28, 4, tft.color565(90, 50, 50));
+            cnDrawUtf8(tft, 178, 156, "断开/忘记", TFT_WHITE);
+
+            if (mode == LINK_MODE_WIFI_ONLY)
+                cnDrawUtf8(tft, 8, 186, "对端需开WiFi(无仅ESPNOW)", TFT_LIGHTGREY);
+            else if (mode == LINK_MODE_DUAL)
+                cnDrawUtf8(tft, 8, 186, "已连WiFi时 ESP+WiFi 同时发", TFT_LIGHTGREY);
+            else
+                cnDrawUtf8(tft, 8, 186, "信号差或有WiFi对端时用WiFi", TFT_LIGHTGREY);
+        } else {
+            cnDrawUtf8(tft, 8, 130, "仅使用 ESP-NOW", TFT_CYAN);
+            cnDrawUtf8(tft, 8, 150, "左侧显示 Signal 信号格", TFT_DARKGREY);
+            cnDrawUtf8(tft, 8, 170, "仅WiFi端不可见本机", TFT_DARKGREY);
+        }
+    } else if (settingsPage == SETTINGS_PAGE_WIFI_LIST) {
+        cnDrawUtf8(tft, 8, 30, "选择 WiFi", TFT_WHITE);
+        if (!wifiScanDone()) {
+            cnDrawUtf8(tft, 8, 100, "扫描中…", TFT_YELLOW);
+        } else {
+            int n = wifiScanCount();
+            if (n == 0)
+                cnDrawUtf8(tft, 8, 100, "未找到网络", TFT_DARKGREY);
+            int listTop = 48;
+            int rowH = 22;
+            int maxShow = (SCREEN_HEIGHT - listTop - 8) / rowH;
+            if (settingsWifiScroll < 0) settingsWifiScroll = 0;
+            if (n > maxShow && settingsWifiScroll > n - maxShow)
+                settingsWifiScroll = n - maxShow;
+            for (int i = 0; i < maxShow; i++) {
+                int idx = settingsWifiScroll + i;
+                if (idx >= n) break;
+                WifiScanItem_t it;
+                if (!wifiGetScanItem(idx, &it)) continue;
+                int y = listTop + i * rowH;
+                uint16_t bg = (idx == settingsSelectedAp) ? tft.color565(40, 70, 100)
+                                                          : tft.color565(24, 28, 40);
+                tft.fillRoundRect(6, y, SCREEN_WIDTH - 12, rowH - 2, 2, bg);
+                char line[40];
+                snprintf(line, sizeof(line), "%s %s %ddB",
+                         it.ssid, it.open ? "[open]" : "", (int)it.rssi);
+                tft.setTextColor(TFT_WHITE, bg);
+                tft.setTextDatum(TL_DATUM);
+                tft.drawString(line, 12, y + 5, 1);
+            }
+        }
+    } else if (settingsPage == SETTINGS_PAGE_WIFI_PASS) {
+        char title[40];
+        WifiScanItem_t it;
+        const char *ssid = "?";
+        if (settingsSelectedAp >= 0 && wifiGetScanItem(settingsSelectedAp, &it))
+            ssid = it.ssid;
+        snprintf(title, sizeof(title), "密码: %s", ssid);
+        tft.setTextColor(TFT_WHITE, tft.color565(14, 16, 24));
+        tft.setTextDatum(TL_DATUM);
+        tft.drawString(title, 8, 30, 1);
+
+        tft.fillRoundRect(8, 50, SCREEN_WIDTH - 16, 28, 3, tft.color565(30, 34, 48));
+        tft.setTextColor(TFT_CYAN, tft.color565(30, 34, 48));
+        tft.drawString(settingsPassBuf[0] ? settingsPassBuf : "(空=开放网络)", 14, 58, 1);
+        drawSettingsPassKeyboard();
+    }
+    settingsNeedRedraw = false;
+}
+
+void updateSettingsScreen()
+{
+    if (currentUIState != UI_STATE_SETTINGS)
+        return;
+    bool connecting = wifiConnectInProgress();
+    if (connecting != settingsWasConnecting || wifiIsConnected() || settingsNeedRedraw) {
+        settingsWasConnecting = connecting;
+        if (settingsPage == SETTINGS_PAGE_HOME || settingsNeedRedraw)
+            drawSettingsScreen();
+    }
+    if (settingsPage == SETTINGS_PAGE_WIFI_LIST && wifiScanDone())
+        drawSettingsScreen();
+}
+
+void showSettingsScreen()
+{
+    if (!isScreenOn || inCustomColorMode)
+        return;
+    settingsPage = SETTINGS_PAGE_HOME;
+    settingsFingerDown = false;
+    settingsDragging = false;
+    settingsNeedRedraw = true;
+    currentUIState = UI_STATE_SETTINGS;
+    drawSettingsScreen();
+}
+
+void hideSettingsScreen()
+{
+    if (currentUIState != UI_STATE_SETTINGS)
+        return;
+    currentUIState = UI_STATE_MAIN;
+    redrawMainScreen();
+}
+
+static bool settingsPassKeyTouch(int x, int y)
+{
+    const int keyH = 22;
+    const int keyW = 28;
+    const int startY = 118;
+    const char *rows[] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"};
+    for (int r = 0; r < 4; r++) {
+        int len = (int)strlen(rows[r]);
+        int totalW = len * (keyW + 1);
+        int startX = (SCREEN_WIDTH - totalW) / 2;
+        int ky = startY + r * (keyH + 1);
+        if (y < ky || y > ky + keyH) continue;
+        for (int i = 0; i < len; i++) {
+            int kx = startX + i * (keyW + 1);
+            if (x >= kx && x <= kx + keyW) {
+                char ch = rows[r][i];
+                if (ch >= 'A' && ch <= 'Z' && !settingsPassCaps)
+                    ch = (char)(ch - 'A' + 'a');
+                size_t n = strlen(settingsPassBuf);
+                if (n < WIFI_PASS_MAX) {
+                    settingsPassBuf[n] = ch;
+                    settingsPassBuf[n + 1] = '\0';
+                    drawSettingsScreen();
+                }
+                return true;
+            }
+        }
+    }
+    if (y >= SCREEN_HEIGHT - 26) {
+        if (x < 48) {
+            settingsPassCaps = !settingsPassCaps;
+            drawSettingsScreen();
+            return true;
+        }
+        if (x < 104) {
+            size_t n = strlen(settingsPassBuf);
+            if (n > 0) settingsPassBuf[n - 1] = '\0';
+            drawSettingsScreen();
+            return true;
+        }
+        if (x < 228) {
+            size_t n = strlen(settingsPassBuf);
+            if (n < WIFI_PASS_MAX) {
+                settingsPassBuf[n] = ' ';
+                settingsPassBuf[n + 1] = '\0';
+                drawSettingsScreen();
+            }
+            return true;
+        }
+        // 连接
+        WifiScanItem_t it;
+        if (settingsSelectedAp >= 0 && wifiGetScanItem(settingsSelectedAp, &it)) {
+            showStatusToast("正在连接…", 2000);
+            wifiConnect(it.ssid, settingsPassBuf);
+            settingsPage = SETTINGS_PAGE_HOME;
+            drawSettingsScreen();
+        }
+        return true;
+    }
+    return false;
+}
+
+bool handleSettingsTouch(int x, int y)
+{
+    if (currentUIState != UI_STATE_SETTINGS)
+        return false;
+
+    if (!settingsFingerDown) {
+        settingsFingerDown = true;
+        settingsDragging = false;
+        settingsPressX = x;
+        settingsPressY = y;
+        settingsDragLastY = y;
+
+        // 返回
+        if (y <= 24 && x >= SCREEN_WIDTH - 60) {
+            if (settingsPage == SETTINGS_PAGE_HOME)
+                hideSettingsScreen();
+            else {
+                settingsPage = SETTINGS_PAGE_HOME;
+                drawSettingsScreen();
+            }
+            return true;
+        }
+
+        if (settingsPage == SETTINGS_PAGE_HOME) {
+            // 四选一：两行
+            if (y >= 62 && y <= 88) {
+                if (x < 160) {
+                    setLinkMode(LINK_MODE_ESPNOW_ONLY);
+                    showStatusToast("仅 ESP-NOW", 1200);
+                } else {
+                    setLinkMode(LINK_MODE_WIFI_ON);
+                    showStatusToast("启用 WiFi", 1200);
+                }
+                drawSettingsScreen();
+                return true;
+            }
+            if (y >= 92 && y <= 118) {
+                if (x < 160) {
+                    setLinkMode(LINK_MODE_DUAL);
+                    showStatusToast("双并发", 1200);
+                } else {
+                    setLinkMode(LINK_MODE_WIFI_ONLY);
+                    showStatusToast("仅 WiFi", 1200);
+                }
+                drawSettingsScreen();
+                return true;
+            }
+            if (getLinkMode() != LINK_MODE_ESPNOW_ONLY && y >= 148 && y <= 176) {
+                if (x < 155) {
+                    settingsPage = SETTINGS_PAGE_WIFI_LIST;
+                    settingsWifiScroll = 0;
+                    settingsSelectedAp = -1;
+                    wifiStartScan();
+                    drawSettingsScreen();
+                } else {
+                    wifiDisconnect(true);
+                    showStatusToast("已断开并忘记 WiFi", 1800);
+                    drawSettingsScreen();
+                }
+                return true;
+            }
+        } else if (settingsPage == SETTINGS_PAGE_WIFI_LIST) {
+            // 点击在 release 处理，支持滑动
+        } else if (settingsPage == SETTINGS_PAGE_WIFI_PASS) {
+            settingsPassKeyTouch(x, y);
+        }
+        return true;
+    }
+
+    // 拖动滚动 WiFi 列表
+    if (settingsPage == SETTINGS_PAGE_WIFI_LIST) {
+        if (abs(y - settingsPressY) > 6)
+            settingsDragging = true;
+        if (settingsDragging && settingsDragLastY >= 0) {
+            int dy = settingsDragLastY - y;
+            if (abs(dy) > 2) {
+                settingsWifiScroll += (dy > 0) ? 1 : -1;
+                if (settingsWifiScroll < 0) settingsWifiScroll = 0;
+                drawSettingsScreen();
+            }
+        }
+        settingsDragLastY = y;
+    } else if (settingsPage == SETTINGS_PAGE_WIFI_PASS) {
+        // 按住重复输入忽略
+    }
+    return true;
+}
+
+// 抬手时选 WiFi
+static void settingsSelectWifiOnRelease(int x, int y)
+{
+    if (settingsDragging || settingsPage != SETTINGS_PAGE_WIFI_LIST)
+        return;
+    if (!wifiScanDone())
+        return;
+    int listTop = 48;
+    int rowH = 22;
+    int n = wifiScanCount();
+    int maxShow = (SCREEN_HEIGHT - listTop - 8) / rowH;
+    for (int i = 0; i < maxShow; i++) {
+        int idx = settingsWifiScroll + i;
+        if (idx >= n) break;
+        int ry = listTop + i * rowH;
+        if (y >= ry && y < ry + rowH) {
+            settingsSelectedAp = idx;
+            WifiScanItem_t it;
+            if (wifiGetScanItem(idx, &it)) {
+                if (it.open) {
+                    settingsPassBuf[0] = '\0';
+                    wifiConnect(it.ssid, "");
+                    settingsPage = SETTINGS_PAGE_HOME;
+                    showStatusToast("正在连接开放网络…", 2000);
+                } else {
+                    settingsPassBuf[0] = '\0';
+                    settingsPage = SETTINGS_PAGE_WIFI_PASS;
+                }
+                drawSettingsScreen();
+            }
+            return;
+        }
+    }
+}
+
+void settingsTouchReleased()
+{
+    if (settingsFingerDown && !settingsDragging)
+        settingsSelectWifiOnRelease(settingsPressX, settingsPressY);
+    settingsFingerDown = false;
+    settingsDragging = false;
+    settingsDragLastY = -1;
+}

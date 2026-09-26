@@ -31,6 +31,8 @@
 // 2026.9.26g: 顶部通知更扁；5分钟无操作自动息屏，触摸唤醒。
 // 2026.9.26h: 右下「翻」按钮屏幕 180° 翻转（记忆 NVS）。
 // 2026.9.26i: 右上撤/重按钮，按笔划撤销重做并同步对端。
+// 2026.9.26j: 私聊画板——点左侧 Signal 进在线列表，邀请30s确认，单播加密同步，「退」退出。
+// 2026.9.26k: 设置页 WiFi 扫描连接；ESP-NOW 优先，差信号时与 WiFi 并发。
 
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
@@ -49,6 +51,7 @@
 #include "src/ui_manager.h"   // 引入 UI 管理模块
 #include "src/touch_handler.h" // 引入触摸处理模块
 #include "src/power_manager.h" // 引入电源管理模块
+#include "src/transport_manager.h"
 
 // XY_structure (now XY_TouchPoint_t) 已移至 touch_handler.h
 
@@ -113,6 +116,7 @@ void setup()
     WiFi.disconnect();
     loadLocalDeviceId();
     espNowInit();
+    transportInit(); // WiFi/BT 传输（在 ESP-NOW 之后）
 
     // 4. 记录启动时间
     deviceInitialBootMillis = millis();
@@ -144,6 +148,8 @@ void loop()
     // 处理输入和通信
     handleLocalTouch();         // from touch_handler.cpp
     processIncomingMessages();  // from esp_now_handler.cpp
+    processIncomingPrivQueue(); // 私聊包在主循环处理（勿在 recv 回调画屏）
+    transportLoop();            // WiFi UDP / BT 收发与重连
     handleBootButton();         // from power_manager.cpp
     checkAutoScreenOff();       // 5 分钟无操作自动息屏
     processDeferredSdDetect();  // 启动后延迟轻量探测 SD，不堵第一帧
@@ -184,6 +190,9 @@ void loop()
     checkPeerHeartbeatTimeout(); // 来自 esp_now_handler.cpp
     // 3b. 信号差→恢复后补一次画面全量同步
     processPendingSignalRecoveryResync();
+    // 3c. 私聊画板邀请 30s 超时
+    checkPrivateCanvasTimeouts();
+    updatePrivInviteDialog();
 
     // 4. 更新调试信息 (如果屏幕亮且不在调色模式)
     // isScreenOn 和 inCustomColorMode 分别是来自 power_manager 和 ui_manager 的 extern 变量
@@ -193,6 +202,8 @@ void loop()
         updateStatusOverlays(); // 状态条 / toast / drawing
         updateSignalStrengthDisplay(); // 左侧对端信号（多台每5秒轮换）
         lastDebugInfoUpdateTime = currentTimeForLoop;
+        if (isPrivInviteDialogVisible())
+            drawPrivInviteDialog();
     }
 
     // 5. 更新连接设备计数 (如果不在调色模式且在主界面)
@@ -222,6 +233,20 @@ void loop()
         (currentTimeForLoop - lastOnlinePanelRefresh >= ONLINE_PANEL_REFRESH_MS)) {
         updateOnlinePanelLive();
         lastOnlinePanelRefresh = currentTimeForLoop;
+    }
+    // 8b. 画板在线列表（私聊入口）定时刷新
+    static unsigned long lastOnlineListRefresh = 0;
+    if (currentUIState == UI_STATE_ONLINE_LIST &&
+        (currentTimeForLoop - lastOnlineListRefresh >= ONLINE_PANEL_REFRESH_MS)) {
+        updateOnlineListScreen();
+        lastOnlineListRefresh = currentTimeForLoop;
+    }
+    // 8c. 设置页状态刷新
+    static unsigned long lastSettingsRefresh = 0;
+    if (currentUIState == UI_STATE_SETTINGS &&
+        (currentTimeForLoop - lastSettingsRefresh >= 500UL)) {
+        updateSettingsScreen();
+        lastSettingsRefresh = currentTimeForLoop;
     }
 
     // 短暂延时，避免过于频繁的循环，给其他任务（如WiFi栈）一些时间

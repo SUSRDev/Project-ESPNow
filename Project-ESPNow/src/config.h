@@ -68,11 +68,26 @@
 #define CANVAS_PAGE_PREV_X (CANVAS_PAGE_NEXT_X - CANVAS_PAGE_BTN_W - 1)
 #define CANVAS_PAGE_CLEAR_X (CANVAS_PAGE_PREV_X - CANVAS_PAGE_BTN_W - 1)
 #define CANVAS_FLIP_X (CANVAS_PAGE_CLEAR_X - CANVAS_PAGE_BTN_W - 1) // 屏幕翻转（C 左侧）
+#define CANVAS_EXIT_PRIV_X (CANVAS_FLIP_X - CANVAS_PAGE_BTN_W - 1)   // 退出私聊画板（翻左侧）
 #define CANVAS_PAGE_BTN_Y SCREENSHOT_BUTTON_Y
 #define CANVAS_MAX_PAGES 8
 #define SCREEN_ROT_PREF_KEY "rot"
 #define SCREEN_ROT_DEFAULT 1
 #define SCREEN_ROT_FLIPPED 3
+
+// 私聊画板
+#define PRIV_CANVAS_INVITE_TIMEOUT_MS 30000UL
+#define PRIV_CANVAS_MAGIC 0xA5
+#define ONLINE_LIST_ROW_H 40
+#define ONLINE_LIST_TOP 30
+#define ONLINE_LIST_BOTTOM (SCREEN_HEIGHT - 30)
+#define ONLINE_LIST_HEADER_H 18
+#define ONLINE_LIST_BTN_W 44
+#define ONLINE_LIST_BTN_H 18
+#define PRIV_INVITE_POPUP_W 240
+#define PRIV_INVITE_POPUP_H 100
+#define PRIV_INVITE_POPUP_X ((SCREEN_WIDTH - PRIV_INVITE_POPUP_W) / 2)
+#define PRIV_INVITE_POPUP_Y ((SCREEN_HEIGHT - PRIV_INVITE_POPUP_H) / 2)
 
 // 画布页控制动作（SyncMessage.touch_data.color）
 #define CANVAS_PAGE_ACT_CREATE 1
@@ -177,7 +192,7 @@
 // ESP-NOW 通信相关常量
 #define BROADCAST_INTERVAL 2000             // MAC 地址发现广播间隔 (毫秒)
 #define DEBUG_INFO_UPDATE_INTERVAL 500      // 调试信息更新间隔 (毫秒) — 降低刷屏开销
-#define UPTIME_INFO_BROADCAST_INTERVAL 2000 // 加快 reboot 后画板恢复
+#define UPTIME_INFO_BROADCAST_INTERVAL 5000 // 空闲评估间隔；过大则 reboot 恢复慢，过小则空闲同步太勤
 
 // 调色界面相关常量 — 加宽滑条，底部留给返回键
 #define COLOR_SLIDER_WIDTH 36
@@ -194,20 +209,21 @@
 
 // ESP-NOW 同步逻辑相关常量
 #define MIN_UPTIME_DIFF_FOR_NEW_SYNC_TARGET 2000UL // 更换同步源的最小 uptime 差异
-#define EFFECTIVE_UPTIME_SYNC_THRESHOLD 3000UL     // 有效运行时间差阈值
-#define CANVAS_RESYNC_COOLDOWN_MS 15000UL          // 同步成功后短冷却，避免连环 restore
+#define EFFECTIVE_UPTIME_SYNC_THRESHOLD 5000UL     // 有效运行时间差阈值（加大，少触发空闲同步）
+#define CANVAS_RESYNC_COOLDOWN_MS 120000UL         // 同步成功后冷却 2 分钟，避免连环 restore
 
 // 信号变差→恢复后强制重同步画面（滞回，避免临界抖动）
 #define SIGNAL_BAD_RSSI_DBM (-80)                  // ≤ 此值视为差
 #define SIGNAL_GOOD_RSSI_DBM (-68)                 // ≥ 此值视为好
-#define SIGNAL_BAD_HOLD_MS 3500UL                  // 持续差多久才记为 BAD
-#define SIGNAL_GOOD_HOLD_MS 1800UL                 // 持续好多久才触发恢复同步
-#define SIGNAL_RECOVERY_RESYNC_COOLDOWN_MS 25000UL // 两次信号恢复同步最小间隔
+#define SIGNAL_BAD_HOLD_MS 5000UL                  // 持续差多久才记为 BAD
+#define SIGNAL_GOOD_HOLD_MS 4000UL                 // 持续好多久才触发恢复同步
+#define SIGNAL_RECOVERY_RESYNC_COOLDOWN_MS 180000UL // 信号恢复同步最小间隔 3 分钟
+#define SIGNAL_WIFI_ASSIST_RSSI_DBM (-75)           // ESP-NOW ≤ 此值且已连 WiFi 时并发 UDP
 #define CANVAS_FORCE_RESYNC_FLAG 1                 // SyncMessage.touch_data.x：强制重同步
 
 // 心跳包相关常量
-#define HEARTBEAT_SEND_INTERVAL_MS 3000UL // 心跳包发送间隔 (毫秒)
-#define HEARTBEAT_TIMEOUT_MS 12000UL      // 心跳超时
+#define HEARTBEAT_SEND_INTERVAL_MS 4000UL // 心跳包发送间隔 (毫秒)
+#define HEARTBEAT_TIMEOUT_MS 15000UL      // 心跳超时
 
 // 调试信息切换按钮位置 (C/D 已移除，仅作聊天按钮锚点)
 #define DEBUG_TOGGLE_BUTTON_X 2
@@ -265,6 +281,32 @@
 #define STATUS_BAR_H 12
 #define STATUS_TOAST_MS 2800UL
 #define DRAWING_STATUS_MS 1600UL
+
+// 传输层 / 设置
+#define TRANSPORT_UDP_PORT 4210
+#define TRANSPORT_UDP_MAGIC 0x4553504EU /* 'ESPN' */
+#define NET_PREF_NAMESPACE "netcfg"
+#define NET_PREF_SSID "ssid"
+#define NET_PREF_PASS "pass"
+#define NET_PREF_AUTO "auto"
+#define NET_PREF_LINK_MODE "linkmode"
+
+// 链路模式（设置页三选一）
+#define LINK_MODE_ESPNOW_ONLY 0 // 仅 ESP-NOW
+#define LINK_MODE_WIFI_ON     1 // 启用 WiFi（差信号时辅助）
+#define LINK_MODE_DUAL        2 // WiFi + ESP-NOW 双并发
+#define LINK_MODE_WIFI_ONLY   3 // 仅 WiFi（看不到纯 ESP-NOW 设备）
+
+#define PEER_CAP_ESPNOW 0x01
+#define PEER_CAP_WIFI   0x02
+
+
+#define SETTINGS_BUTTON_X COFFEE_BUTTON_X
+#define SETTINGS_BUTTON_Y COFFEE_BUTTON_Y
+#define SETTINGS_BUTTON_W COFFEE_BUTTON_W
+#define SETTINGS_BUTTON_H COFFEE_BUTTON_H
+#define WIFI_PASS_MAX 64
+#define WIFI_SCAN_MAX_SHOW 12
 
 // 无操作自动息屏（触摸/按键可唤醒；BOOT 短按仍可手动开关）
 #define SCREEN_IDLE_OFF_MS (5UL * 60UL * 1000UL)
