@@ -205,29 +205,118 @@ void drawEraserButton()
 
 void drawEraserSlider()
 {
-    if (!isEraserSliderVisible) return;
-    
+    if (!isEraserSliderVisible)
+        return;
+
     int sliderTop = ERASER_SLIDER_Y - ERASER_SLIDER_HEIGHT / 2;
     int sliderBottom = ERASER_SLIDER_Y + ERASER_SLIDER_HEIGHT / 2;
-    
-    // 绘制滑块背景
-    tft.fillRect(ERASER_SLIDER_X, sliderTop, ERASER_SLIDER_WIDTH, ERASER_SLIDER_HEIGHT, TFT_DARKGREY);
-    tft.drawRect(ERASER_SLIDER_X, sliderTop, ERASER_SLIDER_WIDTH, ERASER_SLIDER_HEIGHT, TFT_WHITE);
-    
-    // 计算滑块手柄位置（从上到下，半径从15到1）
+    int trackX = ERASER_SLIDER_X + (ERASER_SLIDER_HANDLE_W - ERASER_SLIDER_WIDTH) / 2;
+    int panelX = ERASER_SLIDER_X - 4;
+    int panelY = sliderTop - ERASER_PM_BTN_H - 6;
+    int panelW = ERASER_SLIDER_HANDLE_W + ERASER_PM_BTN_W + 20;
+    int panelH = ERASER_SLIDER_HEIGHT + ERASER_PM_BTN_H * 2 + 28;
+
+    // 底板清干净，避免拖动残影
+    tft.fillRect(panelX, panelY, panelW, panelH, TFT_BLACK);
+
+    // 轨道
+    tft.fillRoundRect(trackX, sliderTop, ERASER_SLIDER_WIDTH, ERASER_SLIDER_HEIGHT, 3, tft.color565(50, 50, 60));
+    tft.drawRoundRect(trackX, sliderTop, ERASER_SLIDER_WIDTH, ERASER_SLIDER_HEIGHT, 3, TFT_WHITE);
+
+    // 手柄（大）
     int handleY = map(eraserRadius, ERASER_MIN_RADIUS, ERASER_MAX_RADIUS, sliderBottom, sliderTop);
-    int handleX = ERASER_SLIDER_X + (ERASER_SLIDER_WIDTH - ERASER_SLIDER_HANDLE_W) / 2;
-    
-    // 绘制滑块手柄
-    tft.fillRect(handleX, handleY - ERASER_SLIDER_HANDLE_H / 2, ERASER_SLIDER_HANDLE_W, ERASER_SLIDER_HANDLE_H, TFT_CYAN);
-    tft.drawRect(handleX, handleY - ERASER_SLIDER_HANDLE_H / 2, ERASER_SLIDER_HANDLE_W, ERASER_SLIDER_HANDLE_H, TFT_WHITE);
-    
-    // 显示当前半径值
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setTextSize(1);
+    handleY = constrain(handleY, sliderTop + ERASER_SLIDER_HANDLE_H / 2,
+                        sliderBottom - ERASER_SLIDER_HANDLE_H / 2);
+    tft.fillRoundRect(ERASER_SLIDER_X, handleY - ERASER_SLIDER_HANDLE_H / 2,
+                      ERASER_SLIDER_HANDLE_W, ERASER_SLIDER_HANDLE_H, 3, TFT_CYAN);
+    tft.drawRoundRect(ERASER_SLIDER_X, handleY - ERASER_SLIDER_HANDLE_H / 2,
+                      ERASER_SLIDER_HANDLE_W, ERASER_SLIDER_HANDLE_H, 3, TFT_WHITE);
+
+    // + / - 大按钮
+    int plusY = sliderTop - ERASER_PM_BTN_H - 2;
+    int minusY = sliderBottom + 2;
+    tft.fillRoundRect(ERASER_PM_BTN_X, plusY, ERASER_PM_BTN_W, ERASER_PM_BTN_H, 3, TFT_GREEN);
+    tft.fillRoundRect(ERASER_PM_BTN_X, minusY, ERASER_PM_BTN_W, ERASER_PM_BTN_H, 3, TFT_ORANGE);
+    tft.setTextColor(TFT_BLACK);
     tft.setTextDatum(MC_DATUM);
-    tft.drawNumber(eraserRadius, ERASER_SLIDER_X + ERASER_SLIDER_WIDTH / 2, sliderBottom + 10, 1);
+    tft.drawString("+", ERASER_PM_BTN_X + ERASER_PM_BTN_W / 2, plusY + ERASER_PM_BTN_H / 2, 2);
+    tft.drawString("-", ERASER_PM_BTN_X + ERASER_PM_BTN_W / 2, minusY + ERASER_PM_BTN_H / 2, 2);
+
+    // 预览圆 + 数值
+    int prevCx = ERASER_PM_BTN_X + ERASER_PM_BTN_W / 2;
+    int prevCy = ERASER_SLIDER_Y;
+    int prevR = eraserRadius;
+    if (prevR > 12)
+        prevR = 12;
+    tft.fillCircle(prevCx, prevCy, prevR + 1, TFT_DARKGREY);
+    tft.drawCircle(prevCx, prevCy, prevR, TFT_WHITE);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawNumber(eraserRadius, trackX + ERASER_SLIDER_WIDTH / 2, minusY + ERASER_PM_BTN_H + 10, 1);
     tft.setTextDatum(TL_DATUM);
+}
+
+bool isEraserSliderPressed(int x, int y)
+{
+    if (!isEraserSliderVisible)
+        return false;
+
+    int sliderTop = ERASER_SLIDER_Y - ERASER_SLIDER_HEIGHT / 2;
+    int sliderBottom = ERASER_SLIDER_Y + ERASER_SLIDER_HEIGHT / 2;
+    int plusY = sliderTop - ERASER_PM_BTN_H - 2;
+    int minusY = sliderBottom + 2;
+
+    // 滑条胖触控区
+    if (x >= ERASER_SLIDER_X - ERASER_SLIDER_HIT_PAD &&
+        x <= ERASER_SLIDER_X + ERASER_SLIDER_HANDLE_W + ERASER_SLIDER_HIT_PAD &&
+        y >= sliderTop - 4 && y <= sliderBottom + 4)
+        return true;
+    // +
+    if (x >= ERASER_PM_BTN_X - 2 && x <= ERASER_PM_BTN_X + ERASER_PM_BTN_W + 2 &&
+        y >= plusY - 2 && y <= plusY + ERASER_PM_BTN_H + 2)
+        return true;
+    // -
+    if (x >= ERASER_PM_BTN_X - 2 && x <= ERASER_PM_BTN_X + ERASER_PM_BTN_W + 2 &&
+        y >= minusY - 2 && y <= minusY + ERASER_PM_BTN_H + 2)
+        return true;
+    return false;
+}
+
+void handleEraserSliderTouch(int x, int y)
+{
+    if (!isEraserSliderVisible)
+        return;
+
+    int sliderTop = ERASER_SLIDER_Y - ERASER_SLIDER_HEIGHT / 2;
+    int sliderBottom = ERASER_SLIDER_Y + ERASER_SLIDER_HEIGHT / 2;
+    int plusY = sliderTop - ERASER_PM_BTN_H - 2;
+    int minusY = sliderBottom + 2;
+    int oldR = eraserRadius;
+    static unsigned long lastPmMs = 0;
+
+    // +/- 点按（防抖，避免按住连跳）
+    if (x >= ERASER_PM_BTN_X - 2 && x <= ERASER_PM_BTN_X + ERASER_PM_BTN_W + 2) {
+        if (y >= plusY - 2 && y <= plusY + ERASER_PM_BTN_H + 2) {
+            if (millis() - lastPmMs < 160)
+                return;
+            lastPmMs = millis();
+            eraserRadius = constrain(eraserRadius + 1, ERASER_MIN_RADIUS, ERASER_MAX_RADIUS);
+        } else if (y >= minusY - 2 && y <= minusY + ERASER_PM_BTN_H + 2) {
+            if (millis() - lastPmMs < 160)
+                return;
+            lastPmMs = millis();
+            eraserRadius = constrain(eraserRadius - 1, ERASER_MIN_RADIUS, ERASER_MAX_RADIUS);
+        } else {
+            // 预览区：点一下不改，可拖到旁边滑条
+        }
+    } else {
+        // 拖动滑条：Y 映射半径，X 放宽
+        int yy = constrain(y, sliderTop, sliderBottom);
+        eraserRadius = map(yy, sliderBottom, sliderTop, ERASER_MIN_RADIUS, ERASER_MAX_RADIUS);
+        eraserRadius = constrain(eraserRadius, ERASER_MIN_RADIUS, ERASER_MAX_RADIUS);
+    }
+
+    if (eraserRadius != oldR)
+        drawEraserSlider();
 }
 
 void drawPeerInfoButton()
@@ -356,17 +445,6 @@ bool isEraserButtonPressed(int x, int y)
     return (dx * dx + dy * dy) <= (ERASER_BUTTON_RADIUS * ERASER_BUTTON_RADIUS);
 }
 
-bool isEraserSliderPressed(int x, int y)
-{
-    if (!isEraserSliderVisible) return false;
-    
-    int sliderTop = ERASER_SLIDER_Y - ERASER_SLIDER_HEIGHT / 2;
-    int sliderBottom = ERASER_SLIDER_Y + ERASER_SLIDER_HEIGHT / 2;
-    
-    return x >= ERASER_SLIDER_X && x <= ERASER_SLIDER_X + ERASER_SLIDER_WIDTH &&
-           y >= sliderTop && y <= sliderBottom;
-}
-
 bool isBrushButtonPressed(int x, int y)
 {
     return x >= BRUSH_BUTTON_X - 4 && x <= BRUSH_BUTTON_X + BRUSH_BUTTON_W + 6 &&
@@ -451,25 +529,6 @@ void handleCustomColorTouch(int x, int y)
     // 拖动时不整屏三滑条全刷，只刷预览+当前值（refresh 已含三栏，但比整屏快）
     refreshAllColorSliders();
     updateCurrentColor(tft.color565(redValue, greenValue, blueValue));
-}
-
-void handleEraserSliderTouch(int x, int y)
-{
-    if (!isEraserSliderVisible) return;
-    
-    int sliderTop = ERASER_SLIDER_Y - ERASER_SLIDER_HEIGHT / 2;
-    int sliderBottom = ERASER_SLIDER_Y + ERASER_SLIDER_HEIGHT / 2;
-    
-    if (x >= ERASER_SLIDER_X && x <= ERASER_SLIDER_X + ERASER_SLIDER_WIDTH &&
-        y >= sliderTop && y <= sliderBottom)
-    {
-        // 计算新的半径值（从下到上，半径从1到20）
-        eraserRadius = map(y, sliderBottom, sliderTop, ERASER_MIN_RADIUS, ERASER_MAX_RADIUS);
-        eraserRadius = constrain(eraserRadius, ERASER_MIN_RADIUS, ERASER_MAX_RADIUS);
-        
-        // 重绘滑块
-        drawEraserSlider();
-    }
 }
 
 void handleBrushSliderTouch(int x, int y)
@@ -2156,11 +2215,12 @@ bool eraserOverlapsUi(int cx, int cy, int r)
     if (circleHitsRect(cx, cy, r, CANVAS_PAGE_CLEAR_X - 2, CANVAS_PAGE_BTN_Y - 2,
                        CANVAS_PAGE_BTN_W * 3 + 8, CANVAS_PAGE_BTN_H + 4))
         return true;
-    // 橡皮擦滑块
+    // 橡皮擦滑块 / +/-
     if (isEraserSliderVisible) {
-        int sliderTop = ERASER_SLIDER_Y - ERASER_SLIDER_HEIGHT / 2 - 4;
-        if (circleHitsRect(cx, cy, r, ERASER_SLIDER_X - 4, sliderTop,
-                           ERASER_SLIDER_WIDTH + ERASER_SLIDER_HANDLE_W + 8, ERASER_SLIDER_HEIGHT + 20))
+        int sliderTop = ERASER_SLIDER_Y - ERASER_SLIDER_HEIGHT / 2 - ERASER_PM_BTN_H - 8;
+        int panelW = ERASER_SLIDER_HANDLE_W + ERASER_PM_BTN_W + 24;
+        int panelH = ERASER_SLIDER_HEIGHT + ERASER_PM_BTN_H * 2 + 32;
+        if (circleHitsRect(cx, cy, r, ERASER_SLIDER_X - 6, sliderTop, panelW, panelH))
             return true;
     }
     // 顶部状态条
@@ -2712,6 +2772,8 @@ static size_t chatHistoryCount = 0;
 static char chatInputBuffer[CHAT_TEXT_MAX + 1] = {0};
 static char pinyinBuffer[32] = {0};
 static bool imePinyinMode = true;
+static bool engCapsLock = false; // 英文大写锁定
+
 static ChatTab_e chatTab = CHAT_TAB_PUBLIC;
 static char privatePeerId[DEVICE_ID_MAX_LEN + 1] = {0};
 static char activeGroupId[DEVICE_ID_MAX_LEN + 1] = {0};
@@ -3378,16 +3440,32 @@ static void drawChatCandidates()
 
 static void drawChatKeyboard()
 {
-    const char *rows[] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"};
+    // 英文字母按 caps 显示大小写；拼音模式固定显示大写键面、输入仍小写
+    const bool showUpper = !imePinyinMode && engCapsLock;
+    const char *rowsUpper[] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"};
+    const char *rowsLower[] = {"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"};
+    const char **rows = showUpper ? rowsUpper : rowsLower;
     const char *puncts[] = {"，", "。", "！", "？", "、", "；", "：", "“", "”", "（", "）"};
     const int punctN = 11;
     const int keyW = 28, keyH = CHAT_KEY_H, startY = chatKbdStartY();
+    const int shiftW = 36;
     tft.fillRect(0, startY - 1, SCREEN_WIDTH, chatInputY() - startY + 1, tft.color565(20, 20, 28));
 
     for (int r = 0; r < 4; r++) {
         int len = (int)strlen(rows[r]);
         int totalW = len * (keyW + 1);
         int startX = (SCREEN_WIDTH - totalW) / 2;
+        // 第 4 行左侧：英文模式显示 ⇧ 大小写键
+        if (r == 3 && !imePinyinMode) {
+            int sx = startX - shiftW - 2;
+            if (sx < 2)
+                sx = 2;
+            uint16_t bg = engCapsLock ? TFT_CYAN : tft.color565(70, 70, 90);
+            tft.fillRoundRect(sx, startY + r * (keyH + 1), shiftW, keyH, 2, bg);
+            tft.setTextColor(engCapsLock ? TFT_BLACK : TFT_WHITE, bg);
+            tft.setTextDatum(MC_DATUM);
+            tft.drawString(engCapsLock ? "ABC" : "abc", sx + shiftW / 2, startY + r * (keyH + 1) + keyH / 2, 1);
+        }
         for (int i = 0; i < len; i++) {
             int x = startX + i * (keyW + 1);
             int y = startY + r * (keyH + 1);
@@ -3806,10 +3884,13 @@ static bool handleChatFuncBar(int x, int y)
         if (x >= 200 && x < 228) {
             imePinyinMode = !imePinyinMode;
             pinyinBuffer[0] = 0;
+            if (imePinyinMode)
+                engCapsLock = false;
             candExpanded = false;
             candPage = 0;
             refreshCandidates();
             redrawCandPanelAndMessages();
+            drawChatKeyboard();
             return true;
         }
         if (x >= 230 && x < 258) {
@@ -4188,6 +4269,7 @@ bool handleChatTouch(int x, int y)
         return true;
 
     const int keyW = 28, keyH = CHAT_KEY_H, startY = chatKbdStartY();
+    const int shiftW = 36;
     const char *puncts[] = {"，", "。", "！", "？", "、", "；", "：", "“", "”", "（", "）"};
     const int punctN = 11;
     int pw = 26;
@@ -4206,19 +4288,40 @@ bool handleChatTouch(int x, int y)
         }
     }
 
+    // 英文大小写切换（Z 行左侧）
+    if (!imePinyinMode) {
+        const char *zrow = "ZXCVBNM";
+        int zlen = (int)strlen(zrow);
+        int ztotal = zlen * (keyW + 1);
+        int zstart = (SCREEN_WIDTH - ztotal) / 2;
+        int sx = zstart - shiftW - 2;
+        if (sx < 2)
+            sx = 2;
+        int zy = startY + 3 * (keyH + 1);
+        if (y >= zy && y <= zy + keyH && x >= sx && x <= sx + shiftW) {
+            engCapsLock = !engCapsLock;
+            drawChatKeyboard();
+            return true;
+        }
+    }
+
     const char *rows[] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"};
     for (int r = 0; r < 4; r++) {
         int len = (int)strlen(rows[r]);
         int totalW = len * (keyW + 1);
         int startX = (SCREEN_WIDTH - totalW) / 2;
         int ky = startY + r * (keyH + 1);
-        if (y < ky || y > ky + keyH) continue;
+        if (y < ky || y > ky + keyH)
+            continue;
         for (int i = 0; i < len; i++) {
             int kx = startX + i * (keyW + 1);
             if (x >= kx && x <= kx + keyW) {
                 char ch = rows[r][i];
-                if (ch >= 'A' && ch <= 'Z')
-                    ch = ch - 'A' + 'a';
+                if (ch >= 'A' && ch <= 'Z') {
+                    if (imePinyinMode || !engCapsLock)
+                        ch = (char)(ch - 'A' + 'a');
+                    // engCapsLock：保持大写
+                }
                 if (imePinyinMode && ch >= 'a' && ch <= 'z') {
                     size_t n = strlen(pinyinBuffer);
                     if (n + 1 < sizeof(pinyinBuffer)) {
@@ -4226,7 +4329,7 @@ bool handleChatTouch(int x, int y)
                         pinyinBuffer[n + 1] = 0;
                     }
                 } else {
-                    char tmp[2] = {(ch >= 'a' && ch <= 'z') ? ch : rows[r][i], 0};
+                    char tmp[2] = {ch, 0};
                     appendInputUtf8(tmp);
                 }
                 bool prevExp = candExpanded;

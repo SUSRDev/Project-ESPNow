@@ -24,7 +24,7 @@
 ### 聊天室
 - 大厅 / 私聊 / 群组 / 文字颜色 / 在线列表
 - **中文显示 + 拼音输入**（单音节 / 简拼双音节，如 `ge`→个，`nh`→你好）
-- 扩充中文字库 + 全拼/简拼词组（体积已按 Flash 裁剪）
+- 扩充中文字库约 **6200 字** + 全拼/简拼词组（需 Huge APP 分区）
 - 聊天记录 **掉电保存**，「颜色」页可一键清空
 - 在线列表：信号格 + 延迟动态刷新
 - 群组：创建 / 邀请 / 解散（群主权限）
@@ -49,11 +49,11 @@
 
 中文字库较大。本仓库已附带 `Project-ESPNow/partitions.csv`（**3MB APP**）。
 
-若 IDE 仍报 `Sketch too big` / `text section exceeds`：
+若 IDE 仍报 `Sketch too big` / `text section exceeds` / `Maximum is 1310720`：
 
-1. 工具 → **Partition Scheme** → 选 **Huge APP (3MB No OTA)**  
-2. 或确认打开的是带 `partitions.csv` 的 `Project-ESPNow` 工程目录  
-3. 重新编译上传
+1. **工具 → Partition Scheme → `Huge APP (3MB No OTA)`**（必须改！默认 1.2MB 装不下字库）
+2. 或选 `Custom`（使用本目录 `partitions.csv`）
+3. 改完后重新编译上传
 
 ### 1. 驱动
 安装 **CH340** 驱动（Windows 必做）。

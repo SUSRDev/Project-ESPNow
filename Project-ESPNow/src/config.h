@@ -92,13 +92,18 @@
 #define ERASER_MIN_RADIUS 1        // 橡皮擦最小半径
 #define ERASER_MAX_RADIUS 20       // 橡皮擦最大半径
 
-// 橡皮擦滑块配置
-#define ERASER_SLIDER_X (ERASER_BUTTON_X + ERASER_BUTTON_RADIUS + 5) // 滑块 X 坐标 (橡皮擦按钮右侧)
-#define ERASER_SLIDER_Y ERASER_BUTTON_Y // 滑块 Y 坐标 (与橡皮擦按钮对齐)
-#define ERASER_SLIDER_WIDTH 6       // 滑块宽度
-#define ERASER_SLIDER_HEIGHT 60      // 滑块高度
-#define ERASER_SLIDER_HANDLE_W 10     // 滑块手柄宽度
-#define ERASER_SLIDER_HANDLE_H 8      // 滑块手柄高度
+// 橡皮擦滑块配置（加宽加高，便于手指拖动）
+#define ERASER_SLIDER_X (ERASER_BUTTON_X + ERASER_BUTTON_RADIUS + 8)
+#define ERASER_SLIDER_Y ERASER_BUTTON_Y
+#define ERASER_SLIDER_WIDTH 18
+#define ERASER_SLIDER_HEIGHT 96
+#define ERASER_SLIDER_HANDLE_W 26
+#define ERASER_SLIDER_HANDLE_H 16
+#define ERASER_SLIDER_HIT_PAD 16
+// +/- 快捷键（滑条右侧）
+#define ERASER_PM_BTN_W 22
+#define ERASER_PM_BTN_H 22
+#define ERASER_PM_BTN_X (ERASER_SLIDER_X + ERASER_SLIDER_HANDLE_W + 6)
 
 // 对端信息界面相关常量
 #define MAX_PEERS_TO_DISPLAY 8 // 对端信息界面最多显示的对端数量

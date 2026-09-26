@@ -21,9 +21,9 @@ UI = list(
 
 font = ImageFont.truetype(r"C:\Windows\Fonts\msyh.ttc", 12, index=0)
 W = 12
-MAX_GLYPHS = 4800
-MAX_PER_SYL = 18
-MAX_PHRASES = 1600  # 2/3/4 字词条
+MAX_GLYPHS = 6200
+MAX_PER_SYL = 22
+MAX_PHRASES = 2000  # 2/3/4 字词条
 MAX_WORDS_PER_KEY = 6
 
 def is_bmp(ch: str) -> bool:
