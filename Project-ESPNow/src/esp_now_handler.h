@@ -106,6 +106,8 @@ void replayAllDrawings();       // 重播所有绘图历史 (需要 tft 对象)
 void sendHeartbeat(); // 新增：发送心跳包
 void checkPeerHeartbeatTimeout(); // 新增：检查对端心跳超时
 void processPendingSignalRecoveryResync(); // 信号恢复后补一次全量画面同步
+void noteLocalDestructiveCanvasEdit(); // 清页/清空/撤销后标记，防止对端旧历史盖回来
+void forcePushDrawingHistoryToPeers(); // 强制把本机历史推给对端
 std::vector<PeerInfo_t> getPeerInfoList(); // 新增：获取对端信息列表
 void sendChatPacket(MessageType_t type, const char *text); // 兼容：发到大厅
 void sendChatEx(MessageType_t type, uint8_t mode, const char *targetId, const char *text, uint16_t color);

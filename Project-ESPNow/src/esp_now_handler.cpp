@@ -229,6 +229,7 @@ static void beginRequestAllDrawings()
     iamRequestingAllData = true;
     isAwaitingSyncStartResponse = true;
     allDrawingHistory.clear();
+    clearCanvasRedoStack();
 
     SyncMessage_t syncStartMsg;
     memset(&syncStartMsg, 0, sizeof(syncStartMsg));
@@ -337,6 +338,57 @@ static void updatePeerSignalQuality(const String &peerKey, int8_t rssi,
     st.goodCandidateSince = 0;
 }
 
+static unsigned long lastDestructiveEditMs = 0;
+
+void noteLocalDestructiveCanvasEdit()
+{
+    lastDestructiveEditMs = millis();
+}
+
+static bool recentlyDestructivelyEdited(unsigned long windowMs = 25000UL)
+{
+    if (lastDestructiveEditMs == 0)
+        return false;
+    return (millis() - lastDestructiveEditMs) < windowMs;
+}
+
+void forcePushDrawingHistoryToPeers()
+{
+    // 忙于接收时不要强推，避免双边互踩
+    if (iamRequestingAllData || isReceivingDrawingData || isAwaitingSyncStartResponse)
+        return;
+
+    noteLocalDestructiveCanvasEdit();
+
+    SyncMessage_t syncStart;
+    memset(&syncStart, 0, sizeof(syncStart));
+    syncStart.type = MSG_TYPE_SYNC_START;
+    syncStart.senderUptime = millis();
+    syncStart.senderOffset = relativeBootTimeOffset;
+    size_t pts = allDrawingHistory.size();
+    syncStart.totalPointsForSync = (pts > 65535) ? 65535 : (uint16_t)pts;
+    syncStart.touch_data.x = CANVAS_FORCE_RESYNC_FLAG;
+    sendSyncMessage(&syncStart);
+
+    iamEffectivelyMoreUptimeDevice = true;
+    isSendingDrawingData = true;
+    currentHistorySendIndex = 0;
+    if (!allDrawingHistory.empty())
+        updateSendProgress(0, allDrawingHistory.size());
+    else {
+        // 空历史也要发完成包，让对端清空
+        SyncMessage_t completeMsg;
+        memset(&completeMsg, 0, sizeof(completeMsg));
+        completeMsg.type = MSG_TYPE_ALL_DRAWINGS_COMPLETE;
+        completeMsg.senderUptime = millis();
+        completeMsg.senderOffset = relativeBootTimeOffset;
+        sendSyncMessage(&completeMsg);
+        isSendingDrawingData = false;
+        hideSendProgress();
+    }
+    Serial.println("强制推送本机笔迹历史到对端（清页/权威同步）");
+}
+
 void processPendingSignalRecoveryResync()
 {
     // 大 MAC 等待对端发起超时后，自己兜底发起
@@ -407,6 +459,9 @@ void processPendingSignalRecoveryResync()
         else if (peerPts > localPts + 8)
             amSource = false;
     }
+    // 刚清页/清空：绝不能因为点数变少去向对端拉旧历史
+    if (recentlyDestructivelyEdited(25000UL))
+        amSource = true;
 
     showStatusToast("信号恢复，同步画面…", 2800);
     Serial.print("执行信号恢复画面重同步 vs ");
@@ -655,6 +710,15 @@ void processIncomingMessages()
                 break;
             }
 
+            // 刚清页后点数变少：绝不能再向对端「拉回」旧笔迹
+            if (recentlyDestructivelyEdited(25000UL)) {
+                Serial.println("  本机刚清页/清空：推送本机历史，拒绝拉取对端旧数据");
+                if (!iamRequestingAllData && !isReceivingDrawingData && !isAwaitingSyncStartResponse)
+                    forcePushDrawingHistoryToPeers();
+                markPeerCanvasSynced(peerKey);
+                break;
+            }
+
             Serial.println("收到 MSG_TYPE_UPTIME_INFO (首次与该对端同步评估)");
 
             {
@@ -816,6 +880,7 @@ void processIncomingMessages()
             }
             else if (!iamRequestingAllData && !isSendingDrawingData && !isAwaitingSyncStartResponse)
             {
+                clearCanvasRedoStack();
                 allDrawingHistory.push_back(currentPointData);
                 if (!shouldSkipCanvasPaint() && onViewPage) {
                     setActivityStatus(drawerId,
@@ -878,6 +943,8 @@ void processIncomingMessages()
                     setActivityStatus(who, "删页");
                 else if (action == CANVAS_PAGE_ACT_CLEAR)
                     setActivityStatus(who, "清页");
+                else if (action == CANVAS_PAGE_ACT_UNDO)
+                    setActivityStatus(who, "撤销");
                 else if (action == CANVAS_PAGE_ACT_INFO)
                     setActivityStatus(who, "翻页");
             }
@@ -1104,6 +1171,7 @@ void processIncomingMessages()
         {
             Serial.println("收到 MSG_TYPE_RESET_CANVAS.");
             allDrawingHistory.clear();
+            clearCanvasRedoStack();
             if (shouldSkipCanvasPaint())
                 pendingCanvasRedrawAfterChat = true;
             else
@@ -1134,10 +1202,33 @@ void processIncomingMessages()
         {
             Serial.println("收到 MSG_TYPE_SYNC_START");
             cancelSignalRecoveryFallback();
-            if (iamRequestingAllData && isAwaitingSyncStartResponse && !iamEffectivelyMoreUptimeDevice)
+            const bool forcePush = (msg.touch_data.x == CANVAS_FORCE_RESYNC_FLAG);
+            // 本机刚清页/清空：若对端点数更多，多半是过期历史，拒绝被盖回
+            if (forcePush && recentlyDestructivelyEdited(20000UL) &&
+                msg.totalPointsForSync > allDrawingHistory.size() + 8) {
+                Serial.println("  忽略强制同步：本机刚做过清页，对端历史可能过期");
+                lastKnownPeerUptime = peerRawUptime;
+                lastKnownPeerOffset = peerReceivedOffset;
+                break;
+            }
+
+            const bool acceptSync =
+                forcePush ||
+                (iamRequestingAllData && isAwaitingSyncStartResponse && !iamEffectivelyMoreUptimeDevice);
+
+            if (acceptSync)
             {
-                Serial.println("  本机作为请求方，收到响应方的 SYNC_START。准备清空并接收数据。");
+                if (forcePush)
+                    Serial.println("  接受对端强制推送历史（如清页后权威同步）。");
+                else
+                    Serial.println("  本机作为请求方，收到响应方的 SYNC_START。准备清空并接收数据。");
+
+                // 正在发送则停掉，改收对端权威数据
+                isSendingDrawingData = false;
+                hideSendProgress();
+
                 allDrawingHistory.clear();
+                clearCanvasRedoStack();
                 if (shouldSkipCanvasPaint()) {
                     pendingCanvasRedrawAfterChat = true;
                 } else {
@@ -1150,6 +1241,7 @@ void processIncomingMessages()
                 lastRemoteColor = 0;
                 lastRemotePage = 0;
 
+                iamRequestingAllData = false;
                 isAwaitingSyncStartResponse = false;
                 isReceivingDrawingData = true;
 

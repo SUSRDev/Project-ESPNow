@@ -85,6 +85,7 @@ void drawEraserSlider();      // 新增：绘制橡皮擦滑块
 void drawPeerInfoButton();    // 显示对端信息按钮 (可能显示连接设备数)
 void drawCustomColorButton(); // 显示当前颜色
 void drawStarButton();        // 显示当前颜色, 自定义颜色入口的占位符
+void drawUndoRedoButtons();   // 右上角撤销/重做
 void drawScreenshotButton();  // 绘制截屏按钮 (仅 SD 存在时)
 void drawCanvasPageButtons(); // 右下角画布翻页 / 新建 / 清页 / 翻转
 bool isCanvasPagePrevPressed(int x, int y);
@@ -97,6 +98,12 @@ void handleCanvasPageClear(); // 仅清空当前页笔迹（广播）
 void handleCanvasFlip();      // 屏幕 180° 翻转
 void loadScreenRotation();    // 启动时读取并应用旋转
 uint8_t getScreenRotation();
+bool isUndoButtonPressed(int x, int y);
+bool isRedoButtonPressed(int x, int y);
+void handleCanvasUndo();      // 撤销当前页最后一笔
+void handleCanvasRedo();      // 重做
+void clearCanvasRedoStack();  // 新笔迹后清空重做栈
+void applyRemoteCanvasUndo(uint8_t page); // 对端撤销
 void showCanvasPage(uint8_t page, bool broadcastInfo);
 void applyRemoteCanvasPage(uint8_t action, uint8_t page, uint8_t pageCount);
 uint8_t getCurrentCanvasPage();

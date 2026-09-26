@@ -18,6 +18,7 @@
 static void loadChatHistory();
 static void saveChatHistory();
 static void clearChatHistoryPersistent();
+static void broadcastCanvasPage(uint8_t action, uint8_t page, uint8_t count);
 
 // 来自 Project-ESPNow.ino 的外部变量
 extern SPIClass mySpi; // SPI对象
@@ -104,6 +105,7 @@ void drawMainInterface()
     }
     drawPeerInfoButton(); // 此函数内部会调用 updateConnectedDevicesCount
     drawStarButton(); // 绘制颜色框和 "*"
+    drawUndoRedoButtons();
     drawBrushButton();
     if (isBrushSliderVisible)
         drawBrushSlider();
@@ -365,6 +367,173 @@ void drawBrushButton()
     if (r > 6)
         r = 6;
     tft.fillCircle(BRUSH_BUTTON_X + BRUSH_BUTTON_W / 2, BRUSH_BUTTON_Y + BRUSH_BUTTON_H / 2, r, currentColor);
+}
+
+static std::vector<std::vector<TouchData_t>> canvasRedoStack;
+
+void clearCanvasRedoStack()
+{
+    canvasRedoStack.clear();
+}
+
+void drawUndoRedoButtons()
+{
+    if (currentUIState != UI_STATE_MAIN || inCustomColorMode)
+        return;
+    bool canUndo = false;
+    const size_t n = allDrawingHistory.size();
+    for (size_t i = 0; i < n; i++) {
+        const TouchData_t &d = allDrawingHistory[i];
+        if (!d.isReset && d.page == currentCanvasPage) {
+            canUndo = true;
+            break;
+        }
+    }
+    bool canRedo = !canvasRedoStack.empty();
+
+    tft.fillRect(UNDO_BUTTON_X, UNDO_REDO_BTN_Y, UNDO_REDO_BTN_W, UNDO_REDO_BTN_H,
+                 canUndo ? tft.color565(70, 70, 100) : tft.color565(40, 40, 48));
+    tft.fillRect(REDO_BUTTON_X, UNDO_REDO_BTN_Y, UNDO_REDO_BTN_W, UNDO_REDO_BTN_H,
+                 canRedo ? tft.color565(70, 70, 100) : tft.color565(40, 40, 48));
+    tft.drawRect(UNDO_BUTTON_X, UNDO_REDO_BTN_Y, UNDO_REDO_BTN_W, UNDO_REDO_BTN_H, TFT_DARKGREY);
+    tft.drawRect(REDO_BUTTON_X, UNDO_REDO_BTN_Y, UNDO_REDO_BTN_W, UNDO_REDO_BTN_H, TFT_DARKGREY);
+
+    uint16_t uc = canUndo ? TFT_WHITE : TFT_DARKGREY;
+    uint16_t rc = canRedo ? TFT_WHITE : TFT_DARKGREY;
+    int uw = cnTextWidth("撤");
+    int rw = cnTextWidth("重");
+    cnDrawUtf8(tft, UNDO_BUTTON_X + (UNDO_REDO_BTN_W - uw) / 2, UNDO_REDO_BTN_Y + 1, "撤", uc);
+    cnDrawUtf8(tft, REDO_BUTTON_X + (UNDO_REDO_BTN_W - rw) / 2, UNDO_REDO_BTN_Y + 1, "重", rc);
+}
+
+bool isUndoButtonPressed(int x, int y)
+{
+    if (currentUIState != UI_STATE_MAIN || inCustomColorMode)
+        return false;
+    return x >= UNDO_BUTTON_X - 2 && x <= UNDO_BUTTON_X + UNDO_REDO_BTN_W + 2 &&
+           y >= UNDO_REDO_BTN_Y - 2 && y <= UNDO_REDO_BTN_Y + UNDO_REDO_BTN_H + 2;
+}
+
+bool isRedoButtonPressed(int x, int y)
+{
+    if (currentUIState != UI_STATE_MAIN || inCustomColorMode)
+        return false;
+    return x >= REDO_BUTTON_X - 2 && x <= REDO_BUTTON_X + UNDO_REDO_BTN_W + 2 &&
+           y >= UNDO_REDO_BTN_Y - 2 && y <= UNDO_REDO_BTN_Y + UNDO_REDO_BTN_H + 2;
+}
+
+// 找出当前页最后一连续笔划 [start, end)
+static bool findLastStrokeOnPage(uint8_t page, size_t &start, size_t &end)
+{
+    const size_t n = allDrawingHistory.size();
+    if (n == 0)
+        return false;
+    int endIdx = -1;
+    for (int i = (int)n - 1; i >= 0; --i) {
+        const TouchData_t &d = allDrawingHistory[i];
+        if (d.isReset)
+            continue;
+        if (d.page == page) {
+            endIdx = i;
+            break;
+        }
+    }
+    if (endIdx < 0)
+        return false;
+    int startIdx = endIdx;
+    const unsigned long gapLim = TOUCH_STROKE_INTERVAL * 2UL;
+    while (startIdx > 0) {
+        const TouchData_t &cur = allDrawingHistory[startIdx];
+        const TouchData_t &prev = allDrawingHistory[startIdx - 1];
+        if (prev.isReset || prev.page != page)
+            break;
+        unsigned long dt = (cur.timestamp >= prev.timestamp)
+                               ? (cur.timestamp - prev.timestamp)
+                               : gapLim + 1;
+        if (dt > gapLim)
+            break;
+        startIdx--;
+    }
+    start = (size_t)startIdx;
+    end = (size_t)endIdx + 1;
+    return true;
+}
+
+static bool extractLastStrokeOnPage(uint8_t page, std::vector<TouchData_t> &stroke)
+{
+    size_t start = 0, end = 0;
+    if (!findLastStrokeOnPage(page, start, end))
+        return false;
+    stroke.clear();
+    stroke.reserve(end - start);
+    for (size_t i = start; i < end; i++)
+        stroke.push_back(allDrawingHistory[i]);
+
+    std::vector<TouchData_t> kept;
+    const size_t n = allDrawingHistory.size();
+    kept.reserve(n - (end - start));
+    for (size_t i = 0; i < n; i++) {
+        if (i >= start && i < end)
+            continue;
+        kept.push_back(allDrawingHistory[i]);
+    }
+    allDrawingHistory.clear();
+    for (const auto &d : kept)
+        allDrawingHistory.push_back(d);
+    return true;
+}
+
+void applyRemoteCanvasUndo(uint8_t page)
+{
+    std::vector<TouchData_t> discarded;
+    if (!extractLastStrokeOnPage(page, discarded))
+        return;
+    if (page == currentCanvasPage && currentUIState == UI_STATE_MAIN && !inCustomColorMode)
+        paintCurrentCanvasPage();
+    else if (page == currentCanvasPage)
+        pendingCanvasRedrawAfterChat = true;
+}
+
+void handleCanvasUndo()
+{
+    std::vector<TouchData_t> stroke;
+    if (!extractLastStrokeOnPage(currentCanvasPage, stroke)) {
+        showStatusToast("无可撤销", 900);
+        drawUndoRedoButtons();
+        return;
+    }
+    if (canvasRedoStack.size() >= CANVAS_REDO_STACK_MAX)
+        canvasRedoStack.erase(canvasRedoStack.begin());
+    canvasRedoStack.push_back(std::move(stroke));
+    broadcastCanvasPage(CANVAS_PAGE_ACT_UNDO, currentCanvasPage, canvasPageCount);
+    paintCurrentCanvasPage();
+    drawUndoRedoButtons();
+    showStatusToast("已撤销", 800);
+}
+
+void handleCanvasRedo()
+{
+    if (canvasRedoStack.empty()) {
+        showStatusToast("无可重做", 900);
+        drawUndoRedoButtons();
+        return;
+    }
+    std::vector<TouchData_t> stroke = std::move(canvasRedoStack.back());
+    canvasRedoStack.pop_back();
+    for (const auto &d : stroke) {
+        allDrawingHistory.push_back(d);
+        SyncMessage_t drawMsg;
+        memset(&drawMsg, 0, sizeof(drawMsg));
+        drawMsg.type = MSG_TYPE_DRAW_POINT;
+        drawMsg.senderUptime = millis();
+        drawMsg.senderOffset = relativeBootTimeOffset;
+        drawMsg.touch_data = d;
+        sendSyncMessage(&drawMsg);
+        delay(2);
+    }
+    paintCurrentCanvasPage();
+    drawUndoRedoButtons();
+    showStatusToast("已重做", 800);
 }
 
 void redrawBrushButton()
@@ -1197,6 +1366,8 @@ void performFullCanvasReset()
 {
     unsigned long now = millis();
     allDrawingHistory.clear();
+    clearCanvasRedoStack();
+    noteLocalDestructiveCanvasEdit();
     clearScreenAndCache();
 
     relativeBootTimeOffset = 0;
@@ -1212,7 +1383,11 @@ void performFullCanvasReset()
     resetMsg.touch_data.isReset = true;
     resetMsg.touch_data.timestamp = now;
     resetMsg.touch_data.color = currentColor;
-    sendSyncMessage(&resetMsg);
+    for (int i = 0; i < 2; i++) {
+        sendSyncMessage(&resetMsg);
+        delay(5);
+    }
+    forcePushDrawingHistoryToPeers();
     showStatusToast("已全部清空", 1200);
 }
 
@@ -2003,7 +2178,15 @@ void handleCanvasPageClear()
         return;
     }
     rebuildHistoryClearPage(page);
-    broadcastCanvasPage(CANVAS_PAGE_ACT_CLEAR, page, canvasPageCount);
+    clearCanvasRedoStack();
+    noteLocalDestructiveCanvasEdit();
+    // 多发几次清页，降低 ESP-NOW 丢包导致对端仍留旧笔迹的概率
+    for (int i = 0; i < 3; i++) {
+        broadcastCanvasPage(CANVAS_PAGE_ACT_CLEAR, page, canvasPageCount);
+        delay(8);
+    }
+    // 再强制推送本机历史，确保对端（含未收到 CLEAR 的）与清页后状态一致
+    forcePushDrawingHistoryToPeers();
     paintCurrentCanvasPage();
     char tip[24];
     snprintf(tip, sizeof(tip), "已清第%u页", (unsigned)(page + 1));
@@ -2042,10 +2225,18 @@ void applyRemoteCanvasPage(uint8_t action, uint8_t page, uint8_t pageCount)
     }
     if (action == CANVAS_PAGE_ACT_CLEAR) {
         rebuildHistoryClearPage(page);
+        clearCanvasRedoStack();
+        noteLocalDestructiveCanvasEdit(); // 对端清页也算本地已对齐，防反向旧同步
         if (page == currentCanvasPage)
             paintCurrentCanvasPage();
         else if (currentUIState == UI_STATE_MAIN)
             drawCanvasPageButtons();
+        return;
+    }
+    if (action == CANVAS_PAGE_ACT_UNDO) {
+        applyRemoteCanvasUndo(page);
+        if (currentUIState == UI_STATE_MAIN && !inCustomColorMode)
+            drawUndoRedoButtons();
         return;
     }
     if (action == CANVAS_PAGE_ACT_INFO) {
@@ -2388,9 +2579,10 @@ bool eraserOverlapsUi(int cx, int cy, int r)
     if (circleHitsRect(cx, cy, r, COFFEE_BUTTON_X - 2, COFFEE_BUTTON_Y - 2,
                        COFFEE_BUTTON_W + 4, (DEBUG_TOGGLE_BUTTON_Y + DEBUG_TOGGLE_BUTTON_H) - (COFFEE_BUTTON_Y - 2) + 4))
         return true;
-    // 右上自定义颜色 * + 笔粗
-    if (circleHitsRect(cx, cy, r, CUSTOM_COLOR_BUTTON_X - 2, CUSTOM_COLOR_BUTTON_Y - 2,
-                       CUSTOM_COLOR_BUTTON_W + 4, CUSTOM_COLOR_BUTTON_H + BRUSH_BUTTON_H + 8))
+    // 右上自定义颜色 * + 撤/重 + 笔粗
+    if (circleHitsRect(cx, cy, r, UNDO_BUTTON_X - 2, CUSTOM_COLOR_BUTTON_Y - 2,
+                       (CUSTOM_COLOR_BUTTON_X + CUSTOM_COLOR_BUTTON_W) - (UNDO_BUTTON_X - 2) + 2,
+                       CUSTOM_COLOR_BUTTON_H + BRUSH_BUTTON_H + 8))
         return true;
     if (isBrushSliderVisible) {
         int sliderTop = BRUSH_SLIDER_Y - BRUSH_SLIDER_HEIGHT / 2 - 4;
@@ -2549,6 +2741,7 @@ void redrawUiChrome()
         drawEraserSlider();
     drawPeerInfoButton();
     drawStarButton();
+    drawUndoRedoButtons();
     drawBrushButton();
     if (isBrushSliderVisible)
         drawBrushSlider();

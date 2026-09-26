@@ -59,6 +59,22 @@ public:
         history_vectors.push_back(std::vector<TouchData_t>());
     }
 
+    void pop_back() {
+        if (empty())
+            return;
+        std::vector<TouchData_t> &last = history_vectors.back();
+        if (!last.empty())
+            last.pop_back();
+        if (last.empty() && history_vectors.size() > 1)
+            history_vectors.pop_back();
+    }
+
+    // 保留前 new_size 个元素
+    void truncate(size_t new_size) {
+        while (size() > new_size)
+            pop_back();
+    }
+
     // 获取总元素数量
     size_t size() const {
         size_t total_size = 0;

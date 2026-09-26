@@ -353,6 +353,22 @@ void handleLocalTouch() {
                             peerInfoLongPressHandled = false;
                         }
 
+                        if (isUndoButtonPressed(mapX, mapY)) {
+                            if (mainRising && !mainUiPressConsumed) {
+                                mainUiPressConsumed = true;
+                                handleCanvasUndo();
+                            }
+                            return;
+                        }
+
+                        if (isRedoButtonPressed(mapX, mapY)) {
+                            if (mainRising && !mainUiPressConsumed) {
+                                mainUiPressConsumed = true;
+                                handleCanvasRedo();
+                            }
+                            return;
+                        }
+
                         if (isCustomColorButtonPressed(mapX, mapY)) {
                             if (mainRising && !mainUiPressConsumed) {
                                 mainUiPressConsumed = true;
@@ -458,6 +474,7 @@ void handleLocalTouch() {
                         currentDrawPoint.brushR = isEraserMode ? (uint8_t)eraserRadius : (uint8_t)brushRadius;
                         currentDrawPoint.page = currentCanvasPage;
 
+                        clearCanvasRedoStack();
                         allDrawingHistory.push_back(currentDrawPoint);
 
                         SyncMessage_t drawMsg;
