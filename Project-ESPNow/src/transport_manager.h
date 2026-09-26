@@ -27,6 +27,7 @@ bool transportSend(const uint8_t *data, size_t len, const uint8_t *destMacOrNull
 bool wifiIsConnected();
 const char *wifiConnectedSsid();
 IPAddress wifiLocalIp();
+int32_t wifiApRssi(); // 本机连 AP 的 RSSI，未连接返回 0
 void wifiStartScan();
 bool wifiScanDone();
 int wifiScanCount();
@@ -50,5 +51,13 @@ bool transportUsesWifiIcon(); // UI: show WiFi icon vs signal bars
 bool transportIsDuplicatePacket(const uint8_t *data, int len);
 TransportKind_t transportLastUsed();
 const char *transportStatusLine();
+
+// 跨网（MQTT）：不同 WiFi 也能画，需同一房间号
+bool crossNetEnabled();
+void setCrossNetEnabled(bool on);
+const char *crossNetRoomId();
+void setCrossNetRoomId(const char *room);
+bool crossNetIsConnected();
+const char *crossNetStatusLine();
 
 #endif

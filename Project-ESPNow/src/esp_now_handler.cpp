@@ -3,6 +3,7 @@
 #include "config.h"     // 包含项目配置常量
 #include "ui_manager.h" // << 添加对 UI 管理器的引用
 #include "transport_manager.h"
+#include "game_arcade.h"
 #include <Arduino.h>    // For Serial, millis, etc.
 #include <cstring>      // For memcpy, memset, snprintf
 #include <TFT_eSPI.h> // 需要 TFT_eSPI::color565 等，以及 tft 对象
@@ -825,6 +826,41 @@ void ingestIncomingPacketEx(const uint8_t srcMac[6], const uint8_t *incomingData
 
         processIncomingChatPacket(chatPkt);
     }
+    else if (len == sizeof(GamePacket_t))
+    {
+        GamePacket_t gamePkt;
+        memcpy(&gamePkt, incomingDataPtr, sizeof(gamePkt));
+        gamePkt.senderId[DEVICE_ID_MAX_LEN] = '\0';
+        if (gamePkt.magic != GAME_PKT_MAGIC)
+            return;
+
+        char macStr[18];
+        snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 macUse[0], macUse[1], macUse[2], macUse[3], macUse[4], macUse[5]);
+        String macKey = String(macStr);
+        if (macAllZero && gamePkt.senderId[0])
+            macKey = String("ID:") + gamePkt.senderId;
+        macSet.insert(macKey);
+        peerLastHeartbeat[macKey] = millis();
+        PeerInfo_t &pi = peerInfoMap[macKey];
+        if (pi.firstSeenMs == 0) {
+            pi.firstSeenMs = millis();
+            pi.peerLinkMode = 0xFF;
+        }
+        unsigned long nowMs = millis();
+        if (pi.lastSeenMs > 0 && nowMs >= pi.lastSeenMs)
+            pi.latencyMs = (uint16_t)min(9999UL, nowMs - pi.lastSeenMs);
+        pi.lastSeenMs = nowMs;
+        pi.macAddress = macKey;
+        markCaps(pi);
+        if (rssi)
+            pi.rssi = rssi;
+        if (gamePkt.senderId[0]) {
+            strncpy(pi.deviceId, gamePkt.senderId, DEVICE_ID_MAX_LEN);
+            pi.deviceId[DEVICE_ID_MAX_LEN] = '\0';
+        }
+        enqueueGamePacket(gamePkt, rssi); // 勿在回调里 process/画屏
+    }
     else if (len == strlen("XX:XX:XX:XX:XX:XX") && incomingDataPtr[0] != '{')
     {
         char macStr[18];
@@ -984,20 +1020,54 @@ static void enterPrivateActive(const char *peerId, const uint8_t peerMac[6],
 {
     strncpy(privPeerId, peerId ? peerId : "Peer", DEVICE_ID_MAX_LEN);
     privPeerId[DEVICE_ID_MAX_LEN] = '\0';
-    memcpy(privPeerMac, peerMac, 6);
+    if (peerMac)
+        memcpy(privPeerMac, peerMac, 6);
     deriveSessionKey(nonceA, nonceB);
     ensureUnicastPeer(privPeerMac);
+
+    // 备份公屏，进入全新空白私聊画板（页 1、无笔迹）
     if (!publicHistorySaved)
         savePublicHistoryForPrivate();
+    else {
+        allDrawingHistory.clear();
+        clearCanvasRedoStack();
+        currentCanvasPage = 0;
+        canvasPageCount = 1;
+    }
+
     privPhase = PRIV_PHASE_ACTIVE;
     privInviteDeadlineMs = 0;
     hidePrivInviteDialog();
+
+    // 无论当前在列表/设置/聊天，都切回主界面私聊画板
+    extern bool inCustomColorMode;
+    inCustomColorMode = false;
+    currentUIState = UI_STATE_MAIN;
+    paintCurrentCanvasPage(); // 空画板 + 显示「退」
     onPrivateCanvasSessionChanged();
+
     char tip[40];
     snprintf(tip, sizeof(tip), "私聊画板:%s", privPeerId);
     showStatusToast(tip, 2500);
-    if (currentUIState == UI_STATE_MAIN)
-        paintCurrentCanvasPage();
+}
+
+static void sendPrivAcceptWithRetries()
+{
+    PrivCanvasPacket_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.magic = PRIV_CANVAS_MAGIC;
+    pkt.type = MSG_TYPE_PRIV_ACCEPT;
+    strncpy(pkt.senderId, localDeviceId, DEVICE_ID_MAX_LEN);
+    strncpy(pkt.targetId, privPeerId, DEVICE_ID_MAX_LEN);
+    esp_wifi_get_mac(WIFI_IF_STA, pkt.senderMac);
+    memcpy(pkt.nonce, privLocalNonce, 8);
+    pkt.timestamp = millis();
+    // 多发几次，避免邀请方仍停在「邀请中」
+    for (int i = 0; i < 3; i++) {
+        sendPrivCanvasPacket(&pkt, privPeerMac);
+        sendPrivCanvasPacket(&pkt, nullptr);
+        delay(15);
+    }
 }
 
 void sendPrivCanvasPacket(const PrivCanvasPacket_t *pkt, const uint8_t *destMacOrNull)
@@ -1065,21 +1135,12 @@ void acceptPrivateCanvasInvite()
         return;
     fillRandomNonce(privLocalNonce, 8);
 
-    PrivCanvasPacket_t pkt;
-    memset(&pkt, 0, sizeof(pkt));
-    pkt.magic = PRIV_CANVAS_MAGIC;
-    pkt.type = MSG_TYPE_PRIV_ACCEPT;
-    strncpy(pkt.senderId, localDeviceId, DEVICE_ID_MAX_LEN);
-    strncpy(pkt.targetId, privPeerId, DEVICE_ID_MAX_LEN);
-    esp_wifi_get_mac(WIFI_IF_STA, pkt.senderMac);
-    memcpy(pkt.nonce, privLocalNonce, 8);
-    pkt.timestamp = millis();
-    sendPrivCanvasPacket(&pkt, privPeerMac);
-    sendPrivCanvasPacket(&pkt, nullptr);
-
-    // 邀请方 nonce 暂存在 privSessionKey 临时区：邀请时已把对方 nonce 存入 privSessionKey
+    // 邀请方 nonce 暂存在 privSessionKey
     uint8_t peerNonce[8];
     memcpy(peerNonce, privSessionKey, 8);
+
+    sendPrivAcceptWithRetries();
+    // 被邀请人：先发 ACCEPT，再进入空白私聊画板
     enterPrivateActive(privPeerId, privPeerMac, peerNonce, privLocalNonce);
 }
 
@@ -1223,7 +1284,14 @@ void processIncomingPrivPacket(const PrivCanvasPacket_t &pkt, const uint8_t srcM
             return;
         if (!privIdEquals(pkt.senderId, privPeerId))
             return;
-        enterPrivateActive(privPeerId, srcMac, privLocalNonce, pkt.nonce);
+        // 优先用包内 MAC（WiFi/MQTT 路径 srcMac 可能不准）
+        if (pkt.senderMac[0] || pkt.senderMac[1] || pkt.senderMac[2] ||
+            pkt.senderMac[3] || pkt.senderMac[4] || pkt.senderMac[5])
+            memcpy(privPeerMac, pkt.senderMac, 6);
+        else if (srcMac)
+            memcpy(privPeerMac, srcMac, 6);
+        // 邀请人：对方同意后同样进入空白私聊画板
+        enterPrivateActive(privPeerId, privPeerMac, privLocalNonce, pkt.nonce);
         break;
 
     case MSG_TYPE_PRIV_REJECT:

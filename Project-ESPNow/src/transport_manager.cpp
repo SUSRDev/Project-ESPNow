@@ -3,12 +3,14 @@
 #include "config.h"
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <WiFiClient.h>
 #include <esp_wifi.h>
 #include <Preferences.h>
 #include <esp_now.h>
 #include <cstring>
 #include <vector>
 #include <map>
+#include <cstdlib>
 
 extern char localDeviceId[DEVICE_ID_MAX_LEN + 1];
 extern void ingestIncomingPacket(const uint8_t srcMac[6], const uint8_t *data, int len, int8_t rssi);
@@ -23,6 +25,18 @@ static char savedSsid[33] = {0};
 static char savedPass[65] = {0};
 static bool autoConnect = true;
 static uint8_t linkMode = LINK_MODE_ESPNOW_ONLY;
+
+// Cross-network MQTT relay
+static bool crossNetOn = false;
+static char roomIdBuf[MQTT_ROOM_ID_MAX + 1] = "ROOM1";
+static WiFiClient mqttClient;
+static bool mqttReady = false;
+static unsigned long lastMqttConnectMs = 0;
+static unsigned long lastMqttPingMs = 0;
+static unsigned long lastMqttDiscoverMs = 0;
+static char mqttStatus[28] = "MQTT off";
+static uint8_t mqttRxBuf[640];
+static size_t mqttRxLen = 0;
 
 static int scanCountCached = -1;
 static bool scanRunning = false;
@@ -41,6 +55,8 @@ static unsigned long wifiConnectStartedMs = 0;
 
 static void updateStatus();
 static bool bindUdp();
+static void mqttDisconnectSock();
+static bool mqttDoConnect();
 
 // Dedup dual-path packets (ESP-NOW + WiFi)
 static uint32_t recentPktHash[24];
@@ -174,6 +190,7 @@ void setLinkMode(uint8_t mode)
     if (linkMode == LINK_MODE_ESPNOW_ONLY) {
         udp.stop();
         udpBound = false;
+        mqttDisconnectSock();
     } else {
         if (autoConnect && savedSsid[0] && !wifiIsConnected())
             wifiLoadAndAutoConnect();
@@ -200,22 +217,33 @@ static void updateStatus()
         return;
     }
     if (linkMode == LINK_MODE_WIFI_ONLY) {
-        if (wifiIsConnected())
-            snprintf(statusBuf, sizeof(statusBuf), "仅WiFi %s", wifiConnectedSsid());
-        else
+        if (wifiIsConnected()) {
+            if (crossNetOn)
+                snprintf(statusBuf, sizeof(statusBuf), "仅WiFi %s %s",
+                         mqttReady ? "云" : "…", roomIdBuf);
+            else
+                snprintf(statusBuf, sizeof(statusBuf), "仅WiFi %s", wifiConnectedSsid());
+        } else {
             snprintf(statusBuf, sizeof(statusBuf), "仅WiFi(未连接)");
+        }
         return;
     }
     if (linkMode == LINK_MODE_DUAL) {
-        if (wifiIsConnected())
-            snprintf(statusBuf, sizeof(statusBuf), "双并发 %s", wifiConnectedSsid());
-        else
+        if (wifiIsConnected()) {
+            if (crossNetOn)
+                snprintf(statusBuf, sizeof(statusBuf), "双并发+云 %s", roomIdBuf);
+            else
+                snprintf(statusBuf, sizeof(statusBuf), "双并发 %s", wifiConnectedSsid());
+        } else {
             snprintf(statusBuf, sizeof(statusBuf), "双并发(待连WiFi)");
+        }
         return;
     }
     // WIFI_ON assist
     if (wifiIsConnected()) {
-        if (shouldSendWifi(nullptr))
+        if (crossNetOn)
+            snprintf(statusBuf, sizeof(statusBuf), "WiFi+云 %s", roomIdBuf);
+        else if (shouldSendWifi(nullptr))
             snprintf(statusBuf, sizeof(statusBuf), "WiFi备份 %s", wifiConnectedSsid());
         else
             snprintf(statusBuf, sizeof(statusBuf), "ESP-NOW(WiFi待命)");
@@ -318,6 +346,317 @@ static bool espNowSendRaw(const uint8_t *data, size_t len, const uint8_t *destMa
     return esp_now_send(dest, (uint8_t *)data, len) == ESP_OK;
 }
 
+// ---- Minimal MQTT 3.1.1 (QoS0) for cross-WiFi relay ----
+
+static void mqttTopic(char *out, size_t outLen)
+{
+    snprintf(out, outLen, "%s%s/d", MQTT_TOPIC_PREFIX, roomIdBuf[0] ? roomIdBuf : "ROOM1");
+}
+
+static void mqttWriteRemainingLength(uint8_t *buf, size_t *idx, size_t rem)
+{
+    do {
+        uint8_t b = rem % 128;
+        rem /= 128;
+        if (rem)
+            b |= 0x80;
+        buf[(*idx)++] = b;
+    } while (rem);
+}
+
+static bool mqttWriteFrame(uint8_t typeFlags, const uint8_t *vh, size_t vhLen,
+                           const uint8_t *pl, size_t plLen)
+{
+    if (!mqttClient.connected())
+        return false;
+    size_t rem = vhLen + plLen;
+    uint8_t hdr[5];
+    size_t hi = 0;
+    hdr[hi++] = typeFlags;
+    mqttWriteRemainingLength(hdr, &hi, rem);
+    if (mqttClient.write(hdr, hi) != hi)
+        return false;
+    if (vhLen && mqttClient.write(vh, vhLen) != vhLen)
+        return false;
+    if (plLen && mqttClient.write(pl, plLen) != plLen)
+        return false;
+    return true;
+}
+
+static void mqttDisconnectSock()
+{
+    mqttReady = false;
+    if (mqttClient.connected())
+        mqttClient.stop();
+    snprintf(mqttStatus, sizeof(mqttStatus), "MQTT down");
+}
+
+static bool mqttDoConnect()
+{
+    if (!wifiIsConnected() || !crossNetOn || linkMode == LINK_MODE_ESPNOW_ONLY)
+        return false;
+    if (mqttClient.connected() && mqttReady)
+        return true;
+    mqttDisconnectSock();
+    snprintf(mqttStatus, sizeof(mqttStatus), "MQTT…");
+    if (!mqttClient.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, 4000)) {
+        snprintf(mqttStatus, sizeof(mqttStatus), "MQTT fail");
+        return false;
+    }
+    mqttClient.setNoDelay(true);
+
+    char clientId[28];
+    uint8_t mac[6];
+    getMyMac(mac);
+    snprintf(clientId, sizeof(clientId), "espn%02X%02X%02X%02X",
+             mac[2], mac[3], mac[4], mac[5]);
+
+    // CONNECT
+    uint8_t vh[12];
+    size_t vi = 0;
+    vh[vi++] = 0;
+    vh[vi++] = 4;
+    vh[vi++] = 'M';
+    vh[vi++] = 'Q';
+    vh[vi++] = 'T';
+    vh[vi++] = 'T';
+    vh[vi++] = 4;  // protocol level
+    vh[vi++] = 0x02; // clean session
+    vh[vi++] = (MQTT_KEEPALIVE_SEC >> 8) & 0xFF;
+    vh[vi++] = MQTT_KEEPALIVE_SEC & 0xFF;
+    size_t idLen = strlen(clientId);
+    uint8_t pl[40];
+    size_t pi = 0;
+    pl[pi++] = (idLen >> 8) & 0xFF;
+    pl[pi++] = idLen & 0xFF;
+    memcpy(pl + pi, clientId, idLen);
+    pi += idLen;
+    if (!mqttWriteFrame(0x10, vh, vi, pl, pi)) {
+        mqttDisconnectSock();
+        return false;
+    }
+
+    // wait CONNACK
+    unsigned long t0 = millis();
+    while (millis() - t0 < 3000UL) {
+        if (mqttClient.available() >= 4) {
+            uint8_t ack[4];
+            if (mqttClient.readBytes(ack, 4) == 4 && ack[0] == 0x20 && ack[3] == 0) {
+                // SUBSCRIBE topic
+                char topic[48];
+                mqttTopic(topic, sizeof(topic));
+                size_t tlen = strlen(topic);
+                uint8_t svh[2];
+                svh[0] = 0;
+                svh[1] = 1; // packet id
+                uint8_t spl[64];
+                size_t si = 0;
+                spl[si++] = (tlen >> 8) & 0xFF;
+                spl[si++] = tlen & 0xFF;
+                memcpy(spl + si, topic, tlen);
+                si += tlen;
+                spl[si++] = 0; // QoS0
+                if (!mqttWriteFrame(0x82, svh, 2, spl, si)) {
+                    mqttDisconnectSock();
+                    return false;
+                }
+                mqttReady = true;
+                mqttRxLen = 0;
+                lastMqttPingMs = millis();
+                snprintf(mqttStatus, sizeof(mqttStatus), "MQTT ok");
+                return true;
+            }
+            mqttDisconnectSock();
+            return false;
+        }
+        delay(10);
+    }
+    mqttDisconnectSock();
+    return false;
+}
+
+static bool mqttPublishRaw(const uint8_t *data, size_t len)
+{
+    if (!data || len == 0 || len > 500)
+        return false;
+    if (!mqttReady && !mqttDoConnect())
+        return false;
+
+    uint8_t mac[6];
+    getMyMac(mac);
+    TransportHdr_t hdr;
+    hdr.magic = TRANSPORT_UDP_MAGIC;
+    memcpy(hdr.srcMac, mac, 6);
+    hdr.payloadLen = (uint16_t)len;
+
+    char topic[48];
+    mqttTopic(topic, sizeof(topic));
+    size_t tlen = strlen(topic);
+    size_t bodyLen = sizeof(hdr) + len;
+    if (bodyLen > 520)
+        return false;
+
+    uint8_t vh[64];
+    size_t vi = 0;
+    vh[vi++] = (tlen >> 8) & 0xFF;
+    vh[vi++] = tlen & 0xFF;
+    memcpy(vh + vi, topic, tlen);
+    vi += tlen;
+
+    uint8_t body[520];
+    memcpy(body, &hdr, sizeof(hdr));
+    memcpy(body + sizeof(hdr), data, len);
+
+    if (!mqttWriteFrame(0x30, vh, vi, body, bodyLen)) {
+        mqttDisconnectSock();
+        return false;
+    }
+    return true;
+}
+
+static void mqttHandlePublish(const uint8_t *topic, size_t topicLen,
+                              const uint8_t *payload, size_t payloadLen)
+{
+    (void)topic;
+    (void)topicLen;
+    if (payloadLen < sizeof(TransportHdr_t))
+        return;
+    const TransportHdr_t *hdr = (const TransportHdr_t *)payload;
+    if (hdr->magic != TRANSPORT_UDP_MAGIC)
+        return;
+    if (sizeof(TransportHdr_t) + hdr->payloadLen > payloadLen)
+        return;
+    uint8_t myMac[6];
+    getMyMac(myMac);
+    if (memcmp(hdr->srcMac, myMac, 6) == 0)
+        return;
+
+    const uint8_t *pl = payload + sizeof(TransportHdr_t);
+    int plen = hdr->payloadLen;
+
+    if (plen >= 3 && pl[0] == 'I' && pl[1] == 'D' && pl[2] == ':') {
+        char idBuf[DEVICE_ID_MAX_LEN + 1] = {0};
+        uint8_t peerMode = 0xFF;
+        const char *idStart = (const char *)pl + 3;
+        const char *modeSep = strstr(idStart, "|M:");
+        size_t idLen = modeSep ? (size_t)(modeSep - idStart) : strlen(idStart);
+        if (idLen > DEVICE_ID_MAX_LEN)
+            idLen = DEVICE_ID_MAX_LEN;
+        memcpy(idBuf, idStart, idLen);
+        idBuf[idLen] = '\0';
+        if (modeSep)
+            peerMode = (uint8_t)atoi(modeSep + 3);
+        if (peerMode != LINK_MODE_ESPNOW_ONLY)
+            notePeerWifiPresence(hdr->srcMac, idBuf, peerMode);
+        return;
+    }
+
+    if (transportIsDuplicatePacket(pl, plen))
+        return;
+    ingestIncomingPacketEx(hdr->srcMac, pl, plen, -60, true);
+}
+
+static void mqttPoll()
+{
+    if (!crossNetOn || linkMode == LINK_MODE_ESPNOW_ONLY)
+        return;
+    if (!wifiIsConnected()) {
+        if (mqttReady)
+            mqttDisconnectSock();
+        return;
+    }
+    if (!mqttReady) {
+        if (millis() - lastMqttConnectMs > 5000UL) {
+            lastMqttConnectMs = millis();
+            mqttDoConnect();
+        }
+        return;
+    }
+    if (!mqttClient.connected()) {
+        mqttDisconnectSock();
+        return;
+    }
+
+    // keepalive ping
+    if (millis() - lastMqttPingMs > (MQTT_KEEPALIVE_SEC * 700UL)) {
+        uint8_t ping[2] = {0xC0, 0x00};
+        if (mqttClient.write(ping, 2) != 2)
+            mqttDisconnectSock();
+        lastMqttPingMs = millis();
+    }
+
+    while (mqttClient.available()) {
+        int b = mqttClient.read();
+        if (b < 0)
+            break;
+        if (mqttRxLen < sizeof(mqttRxBuf))
+            mqttRxBuf[mqttRxLen++] = (uint8_t)b;
+        else {
+            mqttRxLen = 0;
+            break;
+        }
+
+        if (mqttRxLen < 2)
+            continue;
+        // decode remaining length
+        size_t mul = 1, rem = 0, rli = 1;
+        bool remDone = false;
+        while (rli < mqttRxLen && rli < 5) {
+            uint8_t enc = mqttRxBuf[rli];
+            rem += (size_t)(enc & 0x7F) * mul;
+            mul *= 128;
+            rli++;
+            if (!(enc & 0x80)) {
+                remDone = true;
+                break;
+            }
+        }
+        if (!remDone)
+            continue;
+        size_t frameLen = rli + rem;
+        if (mqttRxLen < frameLen)
+            continue;
+
+        uint8_t type = mqttRxBuf[0] & 0xF0;
+        if (type == 0x30) { // PUBLISH QoS0
+            if (rem >= 2) {
+                size_t tlen = ((size_t)mqttRxBuf[rli] << 8) | mqttRxBuf[rli + 1];
+                size_t topicStart = rli + 2;
+                if (topicStart + tlen <= frameLen) {
+                    size_t payloadStart = topicStart + tlen;
+                    size_t payloadLen = frameLen - payloadStart;
+                    mqttHandlePublish(mqttRxBuf + topicStart, tlen,
+                                      mqttRxBuf + payloadStart, payloadLen);
+                }
+            }
+        } else if (type == 0xD0) {
+            // PINGRESP
+        } else if (type == 0x90) {
+            // SUBACK
+        }
+
+        // shift buffer
+        size_t left = mqttRxLen - frameLen;
+        if (left)
+            memmove(mqttRxBuf, mqttRxBuf + frameLen, left);
+        mqttRxLen = left;
+    }
+
+    // presence over MQTT
+    if (mqttReady && millis() - lastMqttDiscoverMs > 5000UL) {
+        lastMqttDiscoverMs = millis();
+        char body[40];
+        snprintf(body, sizeof(body), "ID:%s|M:%u",
+                 localDeviceId[0] ? localDeviceId : "Peer", (unsigned)linkMode);
+        mqttPublishRaw((const uint8_t *)body, strlen(body));
+    }
+}
+
+static bool shouldSendMqtt()
+{
+    return crossNetOn && linkMode != LINK_MODE_ESPNOW_ONLY && wifiIsConnected();
+}
+
 bool transportSend(const uint8_t *data, size_t len, const uint8_t *destMacOrNull)
 {
     bool espOk = false;
@@ -328,22 +667,33 @@ bool transportSend(const uint8_t *data, size_t len, const uint8_t *destMacOrNull
     if (shouldSendWifi(destMacOrNull))
         wifiOk = udpSendRaw(data, len, destMacOrNull);
 
-    if (espOk && wifiOk)
+    bool mqttOk = false;
+    if (shouldSendMqtt())
+        mqttOk = mqttPublishRaw(data, len);
+
+    if ((espOk && wifiOk) || (espOk && mqttOk) || (wifiOk && mqttOk))
         lastUsed = TRANSPORT_BOTH;
     else if (espOk)
         lastUsed = TRANSPORT_ESPNOW;
-    else if (wifiOk)
+    else if (wifiOk || mqttOk)
         lastUsed = TRANSPORT_WIFI;
     else
         lastUsed = TRANSPORT_NONE;
 
     updateStatus();
-    return espOk || wifiOk;
+    return espOk || wifiOk || mqttOk;
 }
 
 bool wifiIsConnected()
 {
     return WiFi.status() == WL_CONNECTED;
+}
+
+int32_t wifiApRssi()
+{
+    if (!wifiIsConnected())
+        return 0;
+    return WiFi.RSSI();
 }
 
 const char *wifiConnectedSsid()
@@ -589,6 +939,9 @@ void transportLoop()
             sendWifiDiscover();
         }
         pollUdp();
+        mqttPoll();
+    } else if (mqttReady) {
+        mqttDisconnectSock();
     }
 
     updateStatus();
@@ -606,12 +959,18 @@ void transportInit()
     linkMode = netPrefs.getUChar(NET_PREF_LINK_MODE, LINK_MODE_ESPNOW_ONLY);
     if (linkMode > LINK_MODE_WIFI_ONLY)
         linkMode = LINK_MODE_ESPNOW_ONLY;
+    crossNetOn = netPrefs.getBool(NET_PREF_CROSS_NET, false);
+    String room = netPrefs.getString(NET_PREF_ROOM_ID, "ROOM1");
     netPrefs.end();
 
     strncpy(savedSsid, ssid.c_str(), 32);
     savedSsid[32] = '\0';
     strncpy(savedPass, pass.c_str(), 64);
     savedPass[64] = '\0';
+    strncpy(roomIdBuf, room.c_str(), MQTT_ROOM_ID_MAX);
+    roomIdBuf[MQTT_ROOM_ID_MAX] = '\0';
+    if (!roomIdBuf[0])
+        strncpy(roomIdBuf, "ROOM1", MQTT_ROOM_ID_MAX);
 
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
@@ -619,4 +978,52 @@ void transportInit()
         WiFi.begin(savedSsid, savedPass);
 
     updateStatus();
+}
+
+bool crossNetEnabled() { return crossNetOn; }
+
+void setCrossNetEnabled(bool on)
+{
+    crossNetOn = on;
+    netPrefs.begin(NET_PREF_NAMESPACE, false);
+    netPrefs.putBool(NET_PREF_CROSS_NET, crossNetOn);
+    netPrefs.end();
+    if (!crossNetOn)
+        mqttDisconnectSock();
+    else if (wifiIsConnected())
+        mqttDoConnect();
+    updateStatus();
+}
+
+const char *crossNetRoomId() { return roomIdBuf; }
+
+void setCrossNetRoomId(const char *room)
+{
+    if (!room || !room[0])
+        return;
+    // 只保留字母数字
+    size_t j = 0;
+    for (size_t i = 0; room[i] && j < MQTT_ROOM_ID_MAX; i++) {
+        char c = room[i];
+        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+            roomIdBuf[j++] = c;
+    }
+    roomIdBuf[j] = '\0';
+    if (!roomIdBuf[0])
+        strncpy(roomIdBuf, "ROOM1", MQTT_ROOM_ID_MAX);
+    netPrefs.begin(NET_PREF_NAMESPACE, false);
+    netPrefs.putString(NET_PREF_ROOM_ID, roomIdBuf);
+    netPrefs.end();
+    // 房间变更需重连订阅新 topic
+    mqttDisconnectSock();
+    if (crossNetOn && wifiIsConnected())
+        mqttDoConnect();
+    updateStatus();
+}
+
+bool crossNetIsConnected() { return mqttReady; }
+
+const char *crossNetStatusLine()
+{
+    return mqttStatus;
 }

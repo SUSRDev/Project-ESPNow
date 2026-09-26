@@ -13,6 +13,7 @@
 #include "FS.h"        // 包含文件系统库
 #include <Preferences.h>
 #include "cn_text.h"
+#include "game_arcade.h"
 #include <vector>
 #include <XPT2046_Touchscreen.h>
 
@@ -135,8 +136,9 @@ void drawMainInterface()
                 drawInfoButton();
             }
         }
-        // C/D 已移除；仅保留左下角聊天入口
+        // 左下：聊 + 娱；上方：设
         drawChatJoinButton();
+        drawGameJoinButton();
         drawSettingsButton();
         if (showSendProgress)
         {
@@ -166,6 +168,7 @@ void redrawMainScreen()
         }
         if (privInviteVisible)
             drawPrivInviteDialog();
+        overlayGameInviteIfAny();
     } else if (currentUIState == UI_STATE_COLOR_PICKER) {
         drawColorSelectors();
     } else if (currentUIState == UI_STATE_PEER_INFO) {
@@ -178,6 +181,8 @@ void redrawMainScreen()
         drawOnlineListScreen();
     } else if (currentUIState == UI_STATE_SETTINGS) {
         drawSettingsScreen();
+    } else if (currentUIState == UI_STATE_ARCADE) {
+        redrawGameArcade();
     } else if (currentUIState == UI_STATE_POPUP) {
         drawMainInterface();
         replayAllDrawings();
@@ -189,6 +194,7 @@ void redrawMainScreen()
             showProjectInfoPopup();
         if (isPrivInviteDialogVisible())
             drawPrivInviteDialog();
+        overlayGameInviteIfAny();
     }
 }
 
@@ -216,9 +222,12 @@ void redrawMainScreenWithoutMessage()
         drawOnlineListScreen();
     } else if (currentUIState == UI_STATE_SETTINGS) {
         drawSettingsScreen();
+    } else if (currentUIState == UI_STATE_ARCADE) {
+        redrawGameArcade();
     }
     if (privInviteVisible)
         drawPrivInviteDialog();
+    overlayGameInviteIfAny();
 }
 
 void drawResetButton()
@@ -2028,39 +2037,40 @@ static void drawRssiBars(int x, int y, int8_t rssi)
     }
 }
 
-// level: -1=未连接, 0=很差/高延迟, 1..3=弧段
-static int wifiLevelFromLatencyMs(unsigned long latMs, bool connected)
+// level: -1=未连接, 0..3=质量（用本机 WiFi RSSI + 对端新鲜度，不用心跳间隔假延迟）
+static int wifiLevelFromLink(bool connected, const PeerInfo_t *peer)
 {
     if (!connected)
         return -1;
-    if (latMs == 0)
-        return 2; // 已连但尚无延迟样本
-    if (latMs <= 60)
-        return 3;
-    if (latMs <= 150)
-        return 2;
-    if (latMs <= 350)
-        return 1;
-    return 0;
-}
-
-static unsigned long focusPeerLatencyMs(const PeerInfo_t *pinfo)
-{
-    if (!pinfo)
-        return 0;
-    unsigned long lat = pinfo->latencyMs;
-    unsigned long now = millis();
-    if (pinfo->lastSeenMs > 0 && now >= pinfo->lastSeenMs) {
-        unsigned long age = now - pinfo->lastSeenMs;
-        if (age > lat)
-            lat = age;
+    int32_t rssi = wifiApRssi();
+    int lvl = 2;
+    if (rssi != 0) {
+        if (rssi >= -55)
+            lvl = 3;
+        else if (rssi >= -67)
+            lvl = 2;
+        else if (rssi >= -78)
+            lvl = 1;
+        else
+            lvl = 0;
     }
-    if (lat > 9999)
-        lat = 9999;
-    return lat;
+    // 对端太久没动静才降级（心跳 4s，给足余量）
+    if (peer && peer->lastSeenMs > 0) {
+        unsigned long age = millis() - peer->lastSeenMs;
+        int peerLvl = 3;
+        if (age > 12000UL)
+            peerLvl = 0;
+        else if (age > 8000UL)
+            peerLvl = 1;
+        else if (age > 5000UL)
+            peerLvl = 2;
+        if (peerLvl < lvl)
+            lvl = peerLvl;
+    }
+    return lvl;
 }
 
-// 真 WiFi 扇形图标：未连接灰+叉；已连接按延迟点亮弧
+// 真 WiFi 扇形图标：未连接灰+叉；已连接按质量点亮弧
 static void drawWifiIconByLevel(int x, int y, int level)
 {
     int cx = x + 11;
@@ -2520,10 +2530,10 @@ void drawSignalStrengthInfo()
 
     const bool wifiOn = linkModeWifiEnabled();
     const bool wifiUp = wifiOn && wifiIsConnected();
-    int wifiLv = wifiLevelFromLatencyMs(0, wifiUp);
+    int wifiLv = wifiLevelFromLink(wifiUp, nullptr);
 
     auto drawEmptyLinkHint = [&]() {
-        wifiLv = wifiLevelFromLatencyMs(wifiUp ? 100UL : 0UL, wifiUp);
+        wifiLv = wifiLevelFromLink(wifiUp, nullptr);
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.setTextDatum(TL_DATUM);
         tft.setTextFont(1);
@@ -2581,8 +2591,7 @@ void drawSignalStrengthInfo()
     const PeerInfo_t &pinfo = it->second;
     const char *id = (pinfo.deviceId[0]) ? pinfo.deviceId : "Peer";
     int8_t rssi = pinfo.rssi;
-    unsigned long latMs = focusPeerLatencyMs(&pinfo);
-    wifiLv = wifiLevelFromLatencyMs(latMs, wifiUp);
+    wifiLv = wifiLevelFromLink(wifiUp, &pinfo);
 
     // 轮换到另一台时顶部短暂提示
     if (rotated) {
@@ -2591,9 +2600,10 @@ void drawSignalStrengthInfo()
         showStatusToast(tip, 1800);
     }
 
-    // ID 颜色：WiFi 模式看延迟，ESP 模式看 RSSI
+    // ID 颜色：WiFi 模式看本机 AP 质量；ESP 模式看对端 RSSI
     uint16_t color = TFT_GREEN;
-    if (getLinkMode() == LINK_MODE_WIFI_ONLY) {
+    if (getLinkMode() == LINK_MODE_WIFI_ONLY ||
+        ((getLinkMode() == LINK_MODE_DUAL || getLinkMode() == LINK_MODE_WIFI_ON) && wifiUp)) {
         if (wifiLv < 0)
             color = TFT_DARKGREY;
         else if (wifiLv == 0)
@@ -2636,13 +2646,15 @@ void drawSignalStrengthInfo()
         tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
         tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
         tft.print("tap");
-    } else if (getLinkMode() == LINK_MODE_WIFI_ONLY && wifiUp && latMs > 0) {
+    } else if (wifiUp) {
+        // 显示本机 WiFi RSSI，不再用假延迟
+        int32_t ap = wifiApRssi();
         tft.setTextColor(color, TFT_BLACK);
         tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
-        if (latMs >= 1000)
-            tft.printf("%lus", (unsigned long)(latMs / 1000UL));
+        if (ap != 0)
+            tft.printf("%d", (int)ap);
         else
-            tft.printf("%lu", latMs);
+            tft.print(linkModeIconLabel(wifiLv));
     } else {
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
@@ -3130,6 +3142,7 @@ void redrawUiChrome()
     drawCanvasPageButtons();
     drawSignalStrengthInfo();
     drawChatJoinButton();
+    drawGameJoinButton();
     drawSettingsButton();
     if (isDebugInfoVisible) {
         drawDebugInfo();
@@ -3338,6 +3351,18 @@ void hideNameEditScreen()
     redrawMainScreen();
 }
 
+
+static void utf8DeleteLastChar(char *s)
+{
+    size_t n = strlen(s);
+    if (n == 0)
+        return;
+    size_t i = n - 1;
+    while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80)
+        i--;
+    s[i] = '\0';
+}
+
 void drawNameEditScreen()
 {
     tft.fillScreen(TFT_BLACK);
@@ -3349,15 +3374,31 @@ void drawNameEditScreen()
     bool dup = isDeviceIdTakenByNearbyPeer(nameEditBuffer);
     // 当前输入框
     tft.drawRect(40, 28, SCREEN_WIDTH - 80, 22, dup ? TFT_RED : TFT_WHITE);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(dup ? TFT_RED : TFT_CYAN, TFT_BLACK);
-    tft.drawString(nameEditBuffer[0] ? nameEditBuffer : "_", SCREEN_WIDTH / 2, 39, 2);
-    tft.setTextDatum(TL_DATUM);
+    tft.fillRect(42, 30, SCREEN_WIDTH - 84, 18, TFT_BLACK);
+    if (nameEditBuffer[0]) {
+        int tw = cnTextWidth(nameEditBuffer);
+        int tx = (SCREEN_WIDTH - tw) / 2;
+        if (tx < 44) tx = 44;
+        cnDrawUtf8(tft, tx, 32, nameEditBuffer, dup ? TFT_RED : TFT_CYAN);
+    } else {
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.drawString("_", SCREEN_WIDTH / 2, 39, 2);
+        tft.setTextDatum(TL_DATUM);
+    }
     if (dup) {
         tft.setTextColor(TFT_RED, TFT_BLACK);
         tft.setTextDatum(TC_DATUM);
         tft.drawString("ID used nearby", SCREEN_WIDTH / 2, 14, 1);
         tft.setTextDatum(TL_DATUM);
+    }
+
+    // 中文名快捷（字库已含：汪振乐 / 郑恩宁 / 葛天逸）
+    const char *cnPresets[] = {"汪振乐", "郑恩宁", "葛天逸"};
+    for (int i = 0; i < 3; i++) {
+        int px = 16 + i * 100;
+        tft.fillRoundRect(px, 52, 92, 18, 3, tft.color565(50, 70, 110));
+        cnDrawUtf8(tft, px + 18, 55, cnPresets[i], TFT_WHITE);
     }
 
     const char *rows[] = {
@@ -3372,7 +3413,7 @@ void drawNameEditScreen()
     const int rowCount = 7;
     const int keyW = 28;
     const int keyH = 18;
-    const int startY = 56;
+    const int startY = 76;
 
     for (int r = 0; r < rowCount; r++) {
         const char *row = rows[r];
@@ -3444,7 +3485,22 @@ bool handleNameEditTouch(int x, int y)
     };
     const int keyW = 28;
     const int keyH = 18;
-    const int startY = 56;
+    const int startY = 76;
+
+
+    // 中文名快捷
+    if (y >= 52 && y <= 70) {
+        const char *cnPresets[] = {"汪振乐", "郑恩宁", "葛天逸"};
+        for (int i = 0; i < 3; i++) {
+            int px = 16 + i * 100;
+            if (x >= px && x <= px + 92) {
+                strncpy(nameEditBuffer, cnPresets[i], DEVICE_ID_MAX_LEN);
+                nameEditBuffer[DEVICE_ID_MAX_LEN] = '\0';
+                drawNameEditScreen();
+                return true;
+            }
+        }
+    }
 
     // OK
     if (y >= startY + 6 * (keyH + 3) && y <= startY + 6 * (keyH + 3) + keyH + 2 &&
@@ -3472,9 +3528,8 @@ bool handleNameEditTouch(int x, int y)
     if (y >= startY + 5 * (keyH + 3) && y <= startY + 5 * (keyH + 3) + keyH) {
         int delX = 20 + 3 * (keyW + 4);
         if (x >= delX && x <= delX + keyW * 2 + 4) {
-            size_t n = strlen(nameEditBuffer);
-            if (n > 0) {
-                nameEditBuffer[n - 1] = '\0';
+            if (nameEditBuffer[0]) {
+                utf8DeleteLastChar(nameEditBuffer);
                 drawNameEditScreen();
             }
             return true;
@@ -4389,9 +4444,9 @@ static void drawOnlinePanel()
         char line[20];
         snprintf(line, sizeof(line), "%lums", latency);
         uint16_t latColor = TFT_CYAN;
-        if (latency > 4000)
+        if (latency > 10000)
             latColor = TFT_RED;
-        else if (latency > 2000)
+        else if (latency > 6000)
             latColor = TFT_YELLOW;
         tft.setTextColor(latColor, rowBg);
         tft.setTextDatum(TL_DATUM);
@@ -4542,6 +4597,7 @@ void drawChatRoom()
         drawOnlinePanel();
     }
     paintChatBannerIfNeeded();
+    overlayGameInviteIfAny();
 }
 
 void showChatRoom()
@@ -5192,11 +5248,12 @@ void drawOnlineListScreen()
     tft.setTextDatum(TL_DATUM);
     tft.setTextFont(1);
     cnDrawUtf8(tft, 6, hy + 3, "ID", TFT_LIGHTGREY);
-    cnDrawUtf8(tft, 48, hy + 3, "信号", TFT_LIGHTGREY);
-    cnDrawUtf8(tft, 94, hy + 3, "延迟", TFT_LIGHTGREY);
-    cnDrawUtf8(tft, 140, hy + 3, "电量", TFT_LIGHTGREY);
-    cnDrawUtf8(tft, 184, hy + 3, "上线", TFT_LIGHTGREY);
-    cnDrawUtf8(tft, 248, hy + 3, "操作", TFT_LIGHTGREY);
+    cnDrawUtf8(tft, 52, hy + 3, "信号", TFT_LIGHTGREY);
+    cnDrawUtf8(tft, 92, hy + 3, "延迟", TFT_LIGHTGREY);
+    cnDrawUtf8(tft, 128, hy + 3, "距离", TFT_LIGHTGREY);
+    cnDrawUtf8(tft, 172, hy + 3, "电量", TFT_LIGHTGREY);
+    cnDrawUtf8(tft, 212, hy + 3, "上线", TFT_LIGHTGREY);
+    cnDrawUtf8(tft, 252, hy + 3, "操作", TFT_LIGHTGREY);
     tft.drawFastHLine(4, hy + ONLINE_LIST_HEADER_H - 2, SCREEN_WIDTH - 8, TFT_DARKGREY);
 
     clampOnlineListScroll();
@@ -5246,27 +5303,31 @@ void drawOnlineListScreen()
 
         // 仅当整行大致可见时画文字
         if (rowY >= listTop - 4 && rowY + 16 <= ONLINE_LIST_BOTTOM) {
-            char idShort[8];
-            strncpy(idShort, id, 7);
-            idShort[7] = '\0';
-            tft.setTextColor(TFT_WHITE, rowBg);
-            tft.drawString(idShort, 6, rowY + 6, 1);
+            cnDrawUtf8Ellipsis(tft, 6, rowY + 6, id, TFT_WHITE, 44);
 
-            drawRssiBars(54, rowY + 8, p.rssi);
+            int8_t useRssi = p.rssi;
+            if (linkModeWifiEnabled() && wifiIsConnected() && !p.rssi)
+                useRssi = (int8_t)wifiApRssi();
+            drawRssiBars(54, rowY + 8, useRssi);
 
-            unsigned long lat = p.latencyMs;
-            if (p.lastSeenMs > 0 && now >= p.lastSeenMs) {
-                unsigned long age = now - p.lastSeenMs;
-                if (age > lat) lat = age;
-            }
-            if (lat > 9999) lat = 9999;
+            unsigned long age = 0;
+            if (p.lastSeenMs > 0 && now >= p.lastSeenMs)
+                age = now - p.lastSeenMs;
+            if (age > 9999) age = 9999;
             char latBuf[12];
-            snprintf(latBuf, sizeof(latBuf), "%lu", lat);
+            snprintf(latBuf, sizeof(latBuf), "%lu", age);
             uint16_t latColor = TFT_CYAN;
-            if (lat > 4000) latColor = TFT_RED;
-            else if (lat > 2000) latColor = TFT_YELLOW;
+            if (age > 10000UL)
+                latColor = TFT_RED;
+            else if (age > 6000UL)
+                latColor = TFT_YELLOW;
             tft.setTextColor(latColor, rowBg);
-            tft.drawString(latBuf, 100, rowY + 6, 1);
+            tft.drawString(latBuf, 94, rowY + 6, 1);
+
+            char distBuf[10];
+            formatEstDistance(useRssi, distBuf, sizeof(distBuf));
+            tft.setTextColor(TFT_ORANGE, rowBg);
+            tft.drawString(distBuf, 130, rowY + 6, 1);
 
             char batBuf[8];
             if (p.batteryPercent > 0)
@@ -5274,12 +5335,12 @@ void drawOnlineListScreen()
             else
                 snprintf(batBuf, sizeof(batBuf), "--");
             tft.setTextColor(TFT_GREENYELLOW, rowBg);
-            tft.drawString(batBuf, 148, rowY + 6, 1);
+            tft.drawString(batBuf, 176, rowY + 6, 1);
 
             char upBuf[10];
             formatOnlineDuration(p.firstSeenMs, upBuf, sizeof(upBuf));
             tft.setTextColor(TFT_LIGHTGREY, rowBg);
-            tft.drawString(upBuf, 190, rowY + 6, 1);
+            tft.drawString(upBuf, 214, rowY + 6, 1);
 
             bool busy = isPrivateCanvasActive() || isPrivateCanvasInvitePending();
             uint16_t btnC = busy ? tft.color565(70, 70, 80) : tft.color565(40, 110, 90);
@@ -5291,6 +5352,7 @@ void drawOnlineListScreen()
     }
     if (privInviteVisible)
         drawPrivInviteDialog();
+    overlayGameInviteIfAny();
 }
 
 void updateOnlineListScreen()
@@ -5513,6 +5575,7 @@ void onPrivateCanvasSessionChanged()
     // 在线列表会 fillScreen，必须把邀请弹窗叠回去
     if (privInviteVisible)
         drawPrivInviteDialog();
+    overlayGameInviteIfAny();
 }
 
 // ========== 设置：WiFi / 传输 ==========
@@ -5520,7 +5583,8 @@ void onPrivateCanvasSessionChanged()
 enum SettingsPage_e {
     SETTINGS_PAGE_HOME = 0,
     SETTINGS_PAGE_WIFI_LIST,
-    SETTINGS_PAGE_WIFI_PASS
+    SETTINGS_PAGE_WIFI_PASS,
+    SETTINGS_PAGE_ROOM
 };
 
 static int settingsPage = SETTINGS_PAGE_HOME;
@@ -5644,12 +5708,28 @@ void drawSettingsScreen()
             tft.fillRoundRect(160, 148, 140, 28, 4, tft.color565(90, 50, 50));
             cnDrawUtf8(tft, 178, 156, "断开/忘记", TFT_WHITE);
 
-            if (mode == LINK_MODE_WIFI_ONLY)
-                cnDrawUtf8(tft, 8, 186, "对端需开WiFi(无仅ESPNOW)", TFT_LIGHTGREY);
+            // 跨网 MQTT：不同 WiFi 同一房间号
+            bool xn = crossNetEnabled();
+            tft.fillRoundRect(8, 182, 100, 26, 4,
+                              xn ? tft.color565(40, 120, 80) : tft.color565(50, 55, 70));
+            cnDrawUtf8(tft, 28, 190, xn ? "跨网开" : "跨网关", TFT_WHITE);
+            tft.fillRoundRect(116, 182, 196, 26, 4, tft.color565(40, 60, 90));
+            char roomLine[28];
+            snprintf(roomLine, sizeof(roomLine), "房:%s %s",
+                     crossNetRoomId(),
+                     crossNetIsConnected() ? "OK" : (xn ? "…" : "-"));
+            tft.setTextColor(TFT_CYAN, tft.color565(40, 60, 90));
+            tft.setTextDatum(TL_DATUM);
+            tft.drawString(roomLine, 124, 190, 1);
+
+            if (xn)
+                cnDrawUtf8(tft, 8, 214, "两边同房间号即可异网互通", TFT_LIGHTGREY);
+            else if (mode == LINK_MODE_WIFI_ONLY)
+                cnDrawUtf8(tft, 8, 214, "对端需开WiFi(无仅ESPNOW)", TFT_LIGHTGREY);
             else if (mode == LINK_MODE_DUAL)
-                cnDrawUtf8(tft, 8, 186, "已连WiFi时 ESP+WiFi 同时发", TFT_LIGHTGREY);
+                cnDrawUtf8(tft, 8, 214, "已连WiFi时 ESP+WiFi 同时发", TFT_LIGHTGREY);
             else
-                cnDrawUtf8(tft, 8, 186, "信号差或有WiFi对端时用WiFi", TFT_LIGHTGREY);
+                cnDrawUtf8(tft, 8, 214, "信号差或有WiFi对端时用WiFi", TFT_LIGHTGREY);
         } else {
             cnDrawUtf8(tft, 8, 130, "仅使用 ESP-NOW", TFT_CYAN);
             cnDrawUtf8(tft, 8, 150, "左侧显示 Signal 信号格", TFT_DARKGREY);
@@ -5701,8 +5781,19 @@ void drawSettingsScreen()
         tft.setTextColor(TFT_CYAN, tft.color565(30, 34, 48));
         tft.drawString(settingsPassBuf[0] ? settingsPassBuf : "(空=开放网络)", 14, 58, 1);
         drawSettingsPassKeyboard();
+    } else if (settingsPage == SETTINGS_PAGE_ROOM) {
+        cnDrawUtf8(tft, 8, 30, "跨网房间号(两边相同)", TFT_WHITE);
+        tft.fillRoundRect(8, 50, SCREEN_WIDTH - 16, 28, 3, tft.color565(30, 34, 48));
+        tft.setTextColor(TFT_CYAN, tft.color565(30, 34, 48));
+        tft.setTextDatum(TL_DATUM);
+        tft.drawString(settingsPassBuf[0] ? settingsPassBuf : crossNetRoomId(), 14, 58, 1);
+        // 复用键盘；底部右侧当「保存」
+        drawSettingsPassKeyboard();
+        tft.fillRoundRect(230, SCREEN_HEIGHT - 26, 82, 22, 2, tft.color565(40, 120, 80));
+        cnDrawUtf8(tft, 250, SCREEN_HEIGHT - 22, "保存", TFT_WHITE);
     }
     settingsNeedRedraw = false;
+    overlayGameInviteIfAny();
 }
 
 void updateSettingsScreen()
@@ -5710,7 +5801,8 @@ void updateSettingsScreen()
     if (currentUIState != UI_STATE_SETTINGS)
         return;
     bool connecting = wifiConnectInProgress();
-    if (connecting != settingsWasConnecting || wifiIsConnected() || settingsNeedRedraw) {
+    if (connecting != settingsWasConnecting || wifiIsConnected() || settingsNeedRedraw ||
+        (crossNetEnabled() && crossNetIsConnected())) {
         settingsWasConnecting = connecting;
         if (settingsPage == SETTINGS_PAGE_HOME || settingsNeedRedraw)
             drawSettingsScreen();
@@ -5757,8 +5849,10 @@ static bool settingsPassKeyTouch(int x, int y)
                 char ch = rows[r][i];
                 if (ch >= 'A' && ch <= 'Z' && !settingsPassCaps)
                     ch = (char)(ch - 'A' + 'a');
+                size_t maxLen = (settingsPage == SETTINGS_PAGE_ROOM) ? (size_t)MQTT_ROOM_ID_MAX
+                                                                    : (size_t)WIFI_PASS_MAX;
                 size_t n = strlen(settingsPassBuf);
-                if (n < WIFI_PASS_MAX) {
+                if (n < maxLen) {
                     settingsPassBuf[n] = ch;
                     settingsPassBuf[n + 1] = '\0';
                     drawSettingsScreen();
@@ -5780,6 +5874,8 @@ static bool settingsPassKeyTouch(int x, int y)
             return true;
         }
         if (x < 228) {
+            if (settingsPage == SETTINGS_PAGE_ROOM)
+                return true; // 房间号不要空格
             size_t n = strlen(settingsPassBuf);
             if (n < WIFI_PASS_MAX) {
                 settingsPassBuf[n] = ' ';
@@ -5788,7 +5884,14 @@ static bool settingsPassKeyTouch(int x, int y)
             }
             return true;
         }
-        // 连接
+        // 连接 / 保存房间
+        if (settingsPage == SETTINGS_PAGE_ROOM) {
+            setCrossNetRoomId(settingsPassBuf[0] ? settingsPassBuf : "ROOM1");
+            showStatusToast("房间已保存", 1200);
+            settingsPage = SETTINGS_PAGE_HOME;
+            drawSettingsScreen();
+            return true;
+        }
         WifiScanItem_t it;
         if (settingsSelectedAp >= 0 && wifiGetScanItem(settingsSelectedAp, &it)) {
             showStatusToast("正在连接…", 2000);
@@ -5862,9 +5965,24 @@ bool handleSettingsTouch(int x, int y)
                 }
                 return true;
             }
+            if (getLinkMode() != LINK_MODE_ESPNOW_ONLY && y >= 182 && y <= 208) {
+                if (x < 112) {
+                    bool on = !crossNetEnabled();
+                    setCrossNetEnabled(on);
+                    showStatusToast(on ? "跨网已开" : "跨网已关", 1200);
+                    drawSettingsScreen();
+                } else {
+                    settingsPage = SETTINGS_PAGE_ROOM;
+                    strncpy(settingsPassBuf, crossNetRoomId(), WIFI_PASS_MAX);
+                    settingsPassBuf[WIFI_PASS_MAX] = '\0';
+                    settingsPassCaps = true;
+                    drawSettingsScreen();
+                }
+                return true;
+            }
         } else if (settingsPage == SETTINGS_PAGE_WIFI_LIST) {
             // 点击在 release 处理，支持滑动
-        } else if (settingsPage == SETTINGS_PAGE_WIFI_PASS) {
+        } else if (settingsPage == SETTINGS_PAGE_WIFI_PASS || settingsPage == SETTINGS_PAGE_ROOM) {
             settingsPassKeyTouch(x, y);
         }
         return true;

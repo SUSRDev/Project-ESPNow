@@ -6,6 +6,7 @@
 #include "ui_manager.h"       // 用于UI函数和状态 (inCustomColorMode, currentColor, currentUIState 等)
 #include "esp_now_handler.h"  // 用于ESP-NOW函数 (sendSyncMessage) 和数据 (allDrawingHistory 等)
 #include "drawing_history.h" // 包含自定义绘图历史头文件
+#include "game_arcade.h"
 
 // --- 静态 (文件局部) 全局变量，用于触摸处理状态 ---
 static TS_Point lastLocalPoint = {0, 0, 0};  // 本地最后一次触摸点坐标
@@ -172,7 +173,16 @@ void handleLocalTouch() {
         }
 
         // 首先处理弹窗关闭逻辑 (Coffee 弹窗优先于项目信息弹窗，如果两者都可能存在)
-        if (isPrivInviteDialogVisible()) {
+        if (isGameInviteDialogVisible()) {
+            xy1 = averageXY();
+            if (!xy1.fly) {
+                int mapX = map(xy1.x, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCREEN_WIDTH);
+                int mapY = map(xy1.y, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCREEN_HEIGHT);
+                handleGameInviteTouch(mapX, mapY);
+                lastLocalPoint.z = 0;
+                return;
+            }
+        } else if (isPrivInviteDialogVisible()) {
             xy1 = averageXY();
             if (!xy1.fly) {
                 int mapX = map(xy1.x, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCREEN_WIDTH);
@@ -232,6 +242,10 @@ void handleLocalTouch() {
                     handleOnlineListTouch(mapX, mapY);
                     break;
 
+                case UI_STATE_ARCADE:
+                    handleGameArcadeTouch(mapX, mapY);
+                    break;
+
                 case UI_STATE_SETTINGS:
                     handleSettingsTouch(mapX, mapY);
                     break;
@@ -263,6 +277,14 @@ void handleLocalTouch() {
                             if (mainRising && !mainUiPressConsumed) {
                                 mainUiPressConsumed = true;
                                 showChatRoom();
+                            }
+                            return;
+                        }
+
+                        if (isGameJoinButtonPressed(mapX, mapY)) {
+                            if (mainRising && !mainUiPressConsumed) {
+                                mainUiPressConsumed = true;
+                                showGameLobby();
                             }
                             return;
                         }
@@ -571,6 +593,8 @@ void handleLocalTouch() {
             onlineListTouchReleased();
         if (currentUIState == UI_STATE_SETTINGS)
             settingsTouchReleased();
+        if (currentUIState == UI_STATE_ARCADE)
+            gameArcadeTouchReleased();
         // 对端信息按钮抬起：短按打开对端列表
         if (peerInfoPressStart != 0 && !peerInfoLongPressHandled) {
             showPeerInfoScreen();

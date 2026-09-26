@@ -52,6 +52,7 @@
 #include "src/touch_handler.h" // 引入触摸处理模块
 #include "src/power_manager.h" // 引入电源管理模块
 #include "src/transport_manager.h"
+#include "src/game_arcade.h"
 
 // XY_structure (now XY_TouchPoint_t) 已移至 touch_handler.h
 
@@ -117,6 +118,7 @@ void setup()
     loadLocalDeviceId();
     espNowInit();
     transportInit(); // WiFi/BT 传输（在 ESP-NOW 之后）
+    gameArcadeInit();
 
     // 4. 记录启动时间
     deviceInitialBootMillis = millis();
@@ -149,6 +151,7 @@ void loop()
     handleLocalTouch();         // from touch_handler.cpp
     processIncomingMessages();  // from esp_now_handler.cpp
     processIncomingPrivQueue(); // 私聊包在主循环处理（勿在 recv 回调画屏）
+    processIncomingGameQueue(); // 游戏包同理，避免双人白屏闪退
     transportLoop();            // WiFi UDP / BT 收发与重连
     handleBootButton();         // from power_manager.cpp
     checkAutoScreenOff();       // 5 分钟无操作自动息屏
@@ -193,6 +196,7 @@ void loop()
     // 3c. 私聊画板邀请 30s 超时
     checkPrivateCanvasTimeouts();
     updatePrivInviteDialog();
+    updateGameInviteDialog();
 
     // 4. 更新调试信息 (如果屏幕亮且不在调色模式)
     // isScreenOn 和 inCustomColorMode 分别是来自 power_manager 和 ui_manager 的 extern 变量
@@ -247,6 +251,10 @@ void loop()
         (currentTimeForLoop - lastSettingsRefresh >= 500UL)) {
         updateSettingsScreen();
         lastSettingsRefresh = currentTimeForLoop;
+    }
+    // 8d. 娱乐大厅 / 游戏动态刷新（雷达扫描等）
+    if (currentUIState == UI_STATE_ARCADE) {
+        updateGameArcade();
     }
 
     // 短暂延时，避免过于频繁的循环，给其他任务（如WiFi栈）一些时间

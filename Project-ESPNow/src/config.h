@@ -237,6 +237,12 @@
 #define CHAT_BUTTON_H DEBUG_TOGGLE_BUTTON_H
 #define CHAT_BUTTON_Y DEBUG_TOGGLE_BUTTON_Y
 
+// 娱乐/游戏按钮 — 聊 右侧
+#define GAME_BUTTON_W CHAT_BUTTON_W
+#define GAME_BUTTON_H CHAT_BUTTON_H
+#define GAME_BUTTON_X (CHAT_BUTTON_X + CHAT_BUTTON_W + 2)
+#define GAME_BUTTON_Y CHAT_BUTTON_Y
+
 // 圆形进度条相关定义
 #define PROGRESS_CIRCLE_RADIUS 6
 #define PROGRESS_CIRCLE_THICKNESS 2
@@ -269,7 +275,7 @@
 #define CHAT_MODE_PUBLIC  0
 #define CHAT_MODE_PRIVATE 1
 #define CHAT_MODE_GROUP   2
-#define DEVICE_ID_MAX_LEN 8
+#define DEVICE_ID_MAX_LEN 18  // 支持中文名（如「汪振乐」约 9 字节 UTF-8）
 #define DEVICE_ID_PREF_NAMESPACE "espnow"
 #define DEVICE_ID_PREF_KEY "devid"
 #define DEVICE_ID_LONG_PRESS_MS 800UL
@@ -290,6 +296,15 @@
 #define NET_PREF_PASS "pass"
 #define NET_PREF_AUTO "auto"
 #define NET_PREF_LINK_MODE "linkmode"
+#define NET_PREF_CROSS_NET "crossnet"
+#define NET_PREF_ROOM_ID "roomid"
+
+// 跨网 MQTT（任意能上网的 WiFi，同一房间号即可互通）
+#define MQTT_BROKER_HOST "broker.emqx.io"
+#define MQTT_BROKER_PORT 1883
+#define MQTT_KEEPALIVE_SEC 30
+#define MQTT_ROOM_ID_MAX 8
+#define MQTT_TOPIC_PREFIX "espn/v1/"
 
 // 链路模式（设置页三选一）
 #define LINK_MODE_ESPNOW_ONLY 0 // 仅 ESP-NOW

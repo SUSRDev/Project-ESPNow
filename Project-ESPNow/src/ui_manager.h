@@ -20,7 +20,8 @@ enum UIState_e {
     UI_STATE_NAME_EDIT,    // 设备标识编辑界面
     UI_STATE_CHAT,         // 局域网群聊界面
     UI_STATE_ONLINE_LIST,  // 画板在线列表（私聊入口）
-    UI_STATE_SETTINGS      // WiFi / 蓝牙设置
+    UI_STATE_SETTINGS,     // WiFi / 蓝牙设置
+    UI_STATE_ARCADE        // 娱乐大厅 / 游戏
 };
 typedef enum UIState_e UIState_t;
 
@@ -156,6 +157,7 @@ void drawCoffeeButton();      // 绘制 "Coffee" 按钮
 void drawChatJoinButton();    // 绘制加入聊天室按钮
 void drawSettingsButton();    // 左下「设」
 bool isSettingsButtonPressed(int x, int y);
+// 娱乐按钮见 game_arcade.h（drawGameJoinButton / isGameJoinButtonPressed）
 void showSettingsScreen();
 void hideSettingsScreen();
 void drawSettingsScreen();
