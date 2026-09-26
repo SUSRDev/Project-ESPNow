@@ -347,7 +347,7 @@ void drawStarButton()
     drawCustomColorButton(); // 绘制颜色部分
     tft.setTextColor(TFT_WHITE);
     tft.setTextDatum(MC_DATUM);
-    tft.drawString("*", CUSTOM_COLOR_BUTTON_X + CUSTOM_COLOR_BUTTON_W / 2, CUSTOM_COLOR_BUTTON_Y + CUSTOM_COLOR_BUTTON_H / 2, 2); // 2号字体
+    tft.drawString("*", CUSTOM_COLOR_BUTTON_X + CUSTOM_COLOR_BUTTON_W / 2, CUSTOM_COLOR_BUTTON_Y + CUSTOM_COLOR_BUTTON_H / 2, 1);
     tft.setTextDatum(TL_DATUM);
 }
 
@@ -1243,13 +1243,7 @@ bool handleClearConfirmTouch(int x, int y)
         return true;
     }
 
-    // 点在弹窗外：取消
-    if (x < CONFIRM_POPUP_X || x > CONFIRM_POPUP_X + CONFIRM_POPUP_W ||
-        y < CONFIRM_POPUP_Y || y > CONFIRM_POPUP_Y + CONFIRM_POPUP_H) {
-        hideClearConfirm(true);
-        return true;
-    }
-
+    // 点在弹窗外：忽略（避免误关）；只有「取消/确定」生效
     return true; // 点在弹窗空白处也吞掉，避免画到下面
 }
 
@@ -1679,7 +1673,7 @@ void drawScreenshotButton()
     tft.fillRect(SCREENSHOT_BUTTON_X, SCREENSHOT_BUTTON_Y, SCREENSHOT_BUTTON_W, SCREENSHOT_BUTTON_H, TFT_WHITE);
     tft.setTextColor(TFT_BLACK);
     tft.setTextDatum(MC_DATUM);
-    tft.drawString("S", SCREENSHOT_BUTTON_X + SCREENSHOT_BUTTON_W / 2, SCREENSHOT_BUTTON_Y + SCREENSHOT_BUTTON_H / 2, 2);
+    tft.drawString("S", SCREENSHOT_BUTTON_X + SCREENSHOT_BUTTON_W / 2, SCREENSHOT_BUTTON_Y + SCREENSHOT_BUTTON_H / 2, 1);
     tft.setTextDatum(TL_DATUM);
 }
 
@@ -1849,26 +1843,26 @@ void drawCanvasPageButtons()
     tft.setTextColor(TFT_WHITE);
     tft.setTextDatum(MC_DATUM);
     tft.drawString("C", CANVAS_PAGE_CLEAR_X + CANVAS_PAGE_BTN_W / 2,
-                   CANVAS_PAGE_BTN_Y + CANVAS_PAGE_BTN_H / 2, 2);
+                   CANVAS_PAGE_BTN_Y + CANVAS_PAGE_BTN_H / 2, 1);
     // 上一页
     tft.fillRect(CANVAS_PAGE_PREV_X, CANVAS_PAGE_BTN_Y, CANVAS_PAGE_BTN_W, CANVAS_PAGE_BTN_H,
                  currentCanvasPage > 0 ? tft.color565(40, 80, 140) : tft.color565(40, 40, 48));
     tft.drawString("<", CANVAS_PAGE_PREV_X + CANVAS_PAGE_BTN_W / 2,
-                   CANVAS_PAGE_BTN_Y + CANVAS_PAGE_BTN_H / 2, 2);
+                   CANVAS_PAGE_BTN_Y + CANVAS_PAGE_BTN_H / 2, 1);
     // 下一页 / 新建
     bool canNew = (canvasPageCount < CANVAS_MAX_PAGES);
     bool atLast = (currentCanvasPage + 1 >= canvasPageCount);
     tft.fillRect(CANVAS_PAGE_NEXT_X, CANVAS_PAGE_BTN_Y, CANVAS_PAGE_BTN_W, CANVAS_PAGE_BTN_H,
                  (atLast ? canNew : true) ? tft.color565(40, 80, 140) : tft.color565(40, 40, 48));
     tft.drawString(atLast ? "+" : ">", CANVAS_PAGE_NEXT_X + CANVAS_PAGE_BTN_W / 2,
-                   CANVAS_PAGE_BTN_Y + CANVAS_PAGE_BTN_H / 2, 2);
+                   CANVAS_PAGE_BTN_Y + CANVAS_PAGE_BTN_H / 2, 1);
     // 页码小标记
     char pg[8];
     snprintf(pg, sizeof(pg), "%u/%u", (unsigned)(currentCanvasPage + 1), (unsigned)canvasPageCount);
     tft.setTextFont(1);
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
     tft.drawString(pg, CANVAS_PAGE_PREV_X + CANVAS_PAGE_BTN_W,
-                   CANVAS_PAGE_BTN_Y - 10, 1);
+                   CANVAS_PAGE_BTN_Y - 8, 1);
     tft.setTextDatum(TL_DATUM);
 }
 
@@ -2146,7 +2140,7 @@ bool saveScreenshotToSD() {
             tft.fillRect(SCREENSHOT_BUTTON_X, SCREENSHOT_BUTTON_Y, SCREENSHOT_BUTTON_W, SCREENSHOT_BUTTON_H, TFT_YELLOW);
             tft.setTextColor(TFT_BLACK);
             tft.setTextDatum(MC_DATUM);
-            tft.drawString("S", SCREENSHOT_BUTTON_X + SCREENSHOT_BUTTON_W / 2, SCREENSHOT_BUTTON_Y + SCREENSHOT_BUTTON_H / 2, 2);
+            tft.drawString("S", SCREENSHOT_BUTTON_X + SCREENSHOT_BUTTON_W / 2, SCREENSHOT_BUTTON_Y + SCREENSHOT_BUTTON_H / 2, 1);
             tft.setTextDatum(TL_DATUM);
             
             File file = SD.open(filename, FILE_WRITE);
@@ -2272,7 +2266,7 @@ bool saveScreenshotToSD() {
             tft.fillRect(SCREENSHOT_BUTTON_X, SCREENSHOT_BUTTON_Y, SCREENSHOT_BUTTON_W, SCREENSHOT_BUTTON_H, TFT_WHITE);
             tft.setTextColor(TFT_BLACK);
             tft.setTextDatum(MC_DATUM);
-            tft.drawString("S", SCREENSHOT_BUTTON_X + SCREENSHOT_BUTTON_W / 2, SCREENSHOT_BUTTON_Y + SCREENSHOT_BUTTON_H / 2, 2);
+            tft.drawString("S", SCREENSHOT_BUTTON_X + SCREENSHOT_BUTTON_W / 2, SCREENSHOT_BUTTON_Y + SCREENSHOT_BUTTON_H / 2, 1);
             tft.setTextDatum(TL_DATUM);
             
             return true;
@@ -2623,7 +2617,8 @@ void updateStatusOverlays()
     bool drawActive = (drawingStatusUntil > now && drawingStatusMsg[0]);
     bool syncing = isReceivingDrawingData || isSendingDrawingData || iamRequestingAllData;
 
-    tft.fillRect(STATUS_BAR_X, STATUS_BAR_Y, STATUS_BAR_W, STATUS_BAR_H, TFT_BLACK);
+    // 多清 1px，抹掉曾因条高不足留下的黄/青底线
+    tft.fillRect(STATUS_BAR_X, STATUS_BAR_Y, STATUS_BAR_W, STATUS_BAR_H + 1, TFT_BLACK);
 
     char line[64];
     uint16_t color = TFT_DARKGREY;
@@ -3293,7 +3288,7 @@ void drawChatJoinButton()
     if (!isScreenOn || inCustomColorMode || currentUIState != UI_STATE_MAIN)
         return;
     tft.fillRect(CHAT_BUTTON_X, CHAT_BUTTON_Y, CHAT_BUTTON_W, CHAT_BUTTON_H, TFT_MAGENTA);
-    cnDrawUtf8(tft, CHAT_BUTTON_X + 2, CHAT_BUTTON_Y + 4, "聊", TFT_WHITE);
+    cnDrawUtf8(tft, CHAT_BUTTON_X + 2, CHAT_BUTTON_Y + 2, "聊", TFT_WHITE);
 }
 
 bool isChatJoinButtonPressed(int x, int y)

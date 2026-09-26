@@ -272,6 +272,8 @@ void handleLocalTouch() {
                             }
 
                             showClearConfirm(CLEAR_CONFIRM_ALL);
+                            // 开弹窗的这次按住还没松开，避免被当成「点外面」立刻关掉
+                            clearConfirmFingerDown = true;
                             return;
                         }
 
@@ -394,6 +396,7 @@ void handleLocalTouch() {
                                     showStatusToast("本页为空", 1000);
                                 } else {
                                     showClearConfirm(CLEAR_CONFIRM_PAGE);
+                                    clearConfirmFingerDown = true;
                                 }
                             }
                             return;
