@@ -21,10 +21,10 @@ UI = list(
 
 font = ImageFont.truetype(r"C:\Windows\Fonts\msyh.ttc", 12, index=0)
 W = 12
-MAX_GLYPHS = 7800
-MAX_PER_SYL = 28
-MAX_PHRASES = 3200  # 2/3/4 字词条
-MAX_WORDS_PER_KEY = 8
+MAX_GLYPHS = 4800
+MAX_PER_SYL = 18
+MAX_PHRASES = 1600  # 2/3/4 字词条
+MAX_WORDS_PER_KEY = 6
 
 def is_bmp(ch: str) -> bool:
     """Only BMP codepoints fit uint16_t glyph tables."""
