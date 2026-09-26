@@ -441,7 +441,7 @@ void handleLocalTouch() {
                         if (isCanvasFlipPressed(mapX, mapY)) {
                             if (mainRising && !mainUiPressConsumed) {
                                 mainUiPressConsumed = true;
-                                handleCanvasFlip();
+                                showClearConfirm(CLEAR_CONFIRM_FLIP);
                             }
                             return;
                         }
@@ -480,18 +480,19 @@ void handleLocalTouch() {
                             return;
 
                         uint32_t drawColor = isEraserMode ? TFT_BLACK : currentColor;
+                        uint16_t myHash = deviceIdToOwnerHash(getLocalDeviceId());
                         if (isEraserMode) {
-                            bool hitUi = false;
                             int r = eraserRadius;
+                            bool erased = false;
                             if (lastLocalPoint.z != 0 &&
                                 (currentRawUptime - lastLocalTouchTime <= TOUCH_STROKE_INTERVAL)) {
-                                hitUi = applyEraserSegment(lastLocalPoint.x, lastLocalPoint.y,
-                                                           mapX, mapY, r);
+                                erased = eraseOwnerInkSegment(lastLocalPoint.x, lastLocalPoint.y,
+                                                              mapX, mapY, r, currentCanvasPage, myHash);
                             } else {
-                                hitUi = applyEraserDot(mapX, mapY, r);
+                                erased = eraseOwnerInkNear(mapX, mapY, r, currentCanvasPage, myHash);
                             }
-                            if (hitUi)
-                                redrawUiChrome();
+                            if (erased)
+                                paintCanvasAfterOwnerErase();
                             setActivityStatus(getLocalDeviceId(), "在擦");
                         } else {
                             int r = brushRadius;
@@ -514,8 +515,10 @@ void handleLocalTouch() {
                         currentDrawPoint.color = drawColor;
                         currentDrawPoint.brushR = isEraserMode ? (uint8_t)eraserRadius : (uint8_t)brushRadius;
                         currentDrawPoint.page = currentCanvasPage;
+                        currentDrawPoint.ownerHash = myHash;
 
                         clearCanvasRedoStack();
+                        // 橡皮：同步给对端「只擦该笔主」；本地墨迹已从历史删掉，仍记一条橡皮事件供回放
                         allDrawingHistory.push_back(currentDrawPoint);
 
                         SyncMessage_t drawMsg;
@@ -574,9 +577,9 @@ void handleLocalTouch() {
         }
         peerInfoPressStart = 0;
         peerInfoLongPressHandled = false;
-        // 橡皮擦抬起后补绘一次 UI，防止边缘擦花按钮
+        // 橡皮擦抬起：完整重绘，确保只剩本机被擦后的画面
         if (isEraserMode && lastLocalPoint.z != 0) {
-            redrawUiChrome();
+            forcePaintCanvasAfterOwnerErase();
         }
         lastLocalPoint.z = 0; // 标记为无触摸 (压力 = 0)
     }

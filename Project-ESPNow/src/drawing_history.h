@@ -16,6 +16,7 @@ typedef struct TouchData_s // 使用 _s 后缀表示 struct，_t 用于 typedef 
     uint32_t color;          // 绘图颜色 (TFT_BLACK = 橡皮)
     uint8_t brushR;          // 笔/橡皮半径；0=旧包（笔按1px，橡皮用本机默认）
     uint8_t page;            // 画布页码（从 0 起）；不同页互不影响
+    uint16_t ownerHash;      // 笔主设备 ID 哈希；0=未知/旧数据（不可当本机笔撤销）
 } TouchData_t;
 
 

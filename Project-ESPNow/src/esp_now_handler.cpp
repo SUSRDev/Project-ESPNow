@@ -1431,6 +1431,8 @@ void processIncomingMessages()
         case MSG_TYPE_DRAW_POINT:
         {
             TouchData_t currentPointData = msg.touch_data; // Declare once at the beginning of the case
+            if (currentPointData.ownerHash == 0 && msg.senderId[0])
+                currentPointData.ownerHash = deviceIdToOwnerHash(msg.senderId);
             int mapX = currentPointData.x;
             int mapY = currentPointData.y;
             const char *drawerId = msg.senderId[0] ? msg.senderId : "?";
@@ -1463,16 +1465,20 @@ void processIncomingMessages()
                                       currentPointData.color == TFT_BLACK ? "在擦" : "在画");
                     if (currentPointData.color == TFT_BLACK) {
                         int r = resolveEraserRadius(currentPointData.brushR);
-                        bool hitUi = false;
+                        uint16_t oh = currentPointData.ownerHash
+                                          ? currentPointData.ownerHash
+                                          : deviceIdToOwnerHash(drawerId);
+                        bool erased = false;
                         if (strokeContinue && lastRemoteColor == TFT_BLACK &&
                             (currentPointData.timestamp - lastRemoteDrawTime <= TOUCH_STROKE_INTERVAL)) {
-                            hitUi = applyEraserSegment(lastRemotePoint.x, lastRemotePoint.y,
-                                                       mapX, mapY, r);
+                            erased = eraseOwnerInkSegment(lastRemotePoint.x, lastRemotePoint.y,
+                                                          mapX, mapY, r, currentPointData.page, oh);
                         } else {
-                            hitUi = applyEraserDot(mapX, mapY, r);
+                            erased = eraseOwnerInkNear(mapX, mapY, r, currentPointData.page, oh);
                         }
-                        if (hitUi)
-                            redrawUiChrome();
+                        // 历史里仍保留橡皮事件；实心点已删
+                        if (erased)
+                            paintCanvasAfterOwnerErase();
                     } else {
                         int r = resolveBrushRadius(currentPointData.brushR);
                         if (!strokeContinue ||
@@ -1485,6 +1491,13 @@ void processIncomingMessages()
                     }
                 } else if (!onViewPage) {
                     // 对端在别的页编辑：只存历史，不污染当前页画面
+                    if (currentPointData.color == TFT_BLACK) {
+                        uint16_t oh = currentPointData.ownerHash
+                                          ? currentPointData.ownerHash
+                                          : deviceIdToOwnerHash(drawerId);
+                        int r = resolveEraserRadius(currentPointData.brushR);
+                        eraseOwnerInkNear(mapX, mapY, r, currentPointData.page, oh);
+                    }
                 } else {
                     pendingCanvasRedrawAfterChat = true;
                 }
@@ -1510,7 +1523,7 @@ void processIncomingMessages()
             uint8_t count = (uint8_t)msg.touch_data.y;
             if (count == 0)
                 count = (uint8_t)msg.touch_data.x; // 兜底
-            applyRemoteCanvasPage(action, page, count);
+            applyRemoteCanvasPage(action, page, count, msg.senderId);
             {
                 const char *who = msg.senderId[0] ? msg.senderId : "Peer";
                 if (action == CANVAS_PAGE_ACT_CREATE)
@@ -2091,69 +2104,6 @@ void processIncomingChatPacket(const ChatPacket_t &pkt)
 // 重播所有绘图历史 (在屏幕上重新绘制所有点和线)
 void replayAllDrawings()
 {
-    // 笔迹只在花瓣画板重放；其它界面只记 pending，返回后再画
-    if (currentUIState != UI_STATE_MAIN || inCustomColorMode) {
-        pendingCanvasRedrawAfterChat = true;
-        return;
-    }
-
-    lastRemotePoint.x = 0;
-    lastRemotePoint.y = 0;
-    lastRemotePoint.z = 0;
-    lastRemoteDrawTime = 0;
-    lastRemoteColor = 0;
-    lastRemotePage = currentCanvasPage;
-
-    const size_t total = allDrawingHistory.size();
-    // 历史过大时降采样绘制，避免同步恢复卡死白屏
-    const size_t stride = (total > 4000) ? 2 : 1;
-
-    for (size_t i = 0; i < total; i += stride)
-    {
-        const auto &drawData = allDrawingHistory[i];
-        if (drawData.isReset)
-        {
-            // 只清画布，不在循环里反复重绘整套 UI（原先此处最卡）
-            tft.fillScreen(TFT_BLACK);
-            lastRemotePoint.x = 0;
-            lastRemotePoint.y = 0;
-            lastRemotePoint.z = 0;
-            lastRemoteDrawTime = drawData.timestamp;
-            lastRemoteColor = 0;
-            continue;
-        }
-        // 只重放当前页，其它页互不影响
-        if (drawData.page != currentCanvasPage)
-            continue;
-        int mapX = drawData.x;
-        int mapY = drawData.y;
-        if (drawData.color == TFT_BLACK) {
-            int r = resolveEraserRadius(drawData.brushR);
-            // 降采样时强制用段擦，避免漏点；同色连续才连段
-            if (lastRemotePoint.z != 0 && lastRemoteColor == TFT_BLACK &&
-                (drawData.timestamp - lastRemoteDrawTime <= TOUCH_STROKE_INTERVAL * 2 || stride > 1)) {
-                applyEraserSegment(lastRemotePoint.x, lastRemotePoint.y, mapX, mapY, r);
-            } else {
-                applyEraserDot(mapX, mapY, r);
-            }
-        } else {
-            int r = resolveBrushRadius(drawData.brushR);
-            if (drawData.timestamp - lastRemoteDrawTime > TOUCH_STROKE_INTERVAL || lastRemotePoint.z == 0 ||
-                lastRemoteColor == TFT_BLACK)
-                applyBrushDot(mapX, mapY, drawData.color, r);
-            else
-                applyBrushSegment(lastRemotePoint.x, lastRemotePoint.y, mapX, mapY, drawData.color, r);
-        }
-        lastRemotePoint.x = mapX;
-        lastRemotePoint.y = mapY;
-        lastRemotePoint.z = 1;
-        lastRemoteDrawTime = drawData.timestamp;
-        lastRemoteColor = drawData.color;
-
-        // 每 64 点让出 CPU，避免看门狗/触摸无响应
-        if ((i & 63) == 0) {
-            yield();
-        }
-    }
-    redrawUiChrome();
+    // 与 paintCurrentCanvasPage 同一路径：橡皮只清本笔主墨迹
+    paintCurrentCanvasPage();
 }

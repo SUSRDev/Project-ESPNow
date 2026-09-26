@@ -55,7 +55,8 @@ extern bool isClearConfirmVisible;   // 清空确认弹窗是否可见
 enum ClearConfirmKind_e {
     CLEAR_CONFIRM_NONE = 0,
     CLEAR_CONFIRM_ALL,   // 左上角清空全部
-    CLEAR_CONFIRM_PAGE   // 右下角清本页
+    CLEAR_CONFIRM_PAGE,  // 右下角清本页
+    CLEAR_CONFIRM_FLIP   // 屏幕翻转确认
 };
 typedef enum ClearConfirmKind_e ClearConfirmKind_t;
 extern ClearConfirmKind_t clearConfirmKind;
@@ -107,9 +108,10 @@ bool isRedoButtonPressed(int x, int y);
 void handleCanvasUndo();      // 撤销当前页最后一笔
 void handleCanvasRedo();      // 重做
 void clearCanvasRedoStack();  // 新笔迹后清空重做栈
-void applyRemoteCanvasUndo(uint8_t page); // 对端撤销
+void applyRemoteCanvasUndo(uint8_t page, const char *ownerId); // 对端撤销（仅对方自己的笔）
 void showCanvasPage(uint8_t page, bool broadcastInfo);
-void applyRemoteCanvasPage(uint8_t action, uint8_t page, uint8_t pageCount);
+void applyRemoteCanvasPage(uint8_t action, uint8_t page, uint8_t pageCount, const char *senderId);
+uint16_t deviceIdToOwnerHash(const char *id);
 uint8_t getCurrentCanvasPage();
 uint8_t getCanvasPageCount();
 bool canvasPageHasContent(uint8_t page);
@@ -260,6 +262,10 @@ bool eraserOverlapsUi(int cx, int cy, int r);
 bool safeEraserFill(int cx, int cy, int r); // 兼容：擦除后若碰 UI 返回 false
 bool applyEraserDot(int cx, int cy, int r); // 擦一点，碰 UI 返回 true
 bool applyEraserSegment(int x0, int y0, int x1, int y1, int r); // 沿路径擦
+bool eraseOwnerInkNear(int cx, int cy, int r, uint8_t page, uint16_t ownerHash);
+bool eraseOwnerInkSegment(int x0, int y0, int x1, int y1, int r, uint8_t page, uint16_t ownerHash);
+void paintCanvasAfterOwnerErase();
+void forcePaintCanvasAfterOwnerErase();
 void applyBrushDot(int cx, int cy, uint32_t color, int r);
 void applyBrushSegment(int x0, int y0, int x1, int y1, uint32_t color, int r);
 int resolveEraserRadius(uint8_t brushR);

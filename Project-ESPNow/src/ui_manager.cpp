@@ -400,6 +400,21 @@ void drawBrushButton()
 
 static std::vector<std::vector<TouchData_t>> canvasRedoStack;
 
+uint16_t deviceIdToOwnerHash(const char *id)
+{
+    if (!id || !id[0])
+        return 0;
+    uint16_t h = 5381;
+    for (const char *p = id; *p; ++p)
+        h = (uint16_t)(((h << 5) + h) ^ (uint8_t)(*p));
+    return h ? h : 1;
+}
+
+static uint16_t localOwnerHash()
+{
+    return deviceIdToOwnerHash(localDeviceId);
+}
+
 void clearCanvasRedoStack()
 {
     canvasRedoStack.clear();
@@ -410,10 +425,11 @@ void drawUndoRedoButtons()
     if (currentUIState != UI_STATE_MAIN || inCustomColorMode)
         return;
     bool canUndo = false;
+    const uint16_t mine = localOwnerHash();
     const size_t n = allDrawingHistory.size();
     for (size_t i = 0; i < n; i++) {
         const TouchData_t &d = allDrawingHistory[i];
-        if (!d.isReset && d.page == currentCanvasPage) {
+        if (!d.isReset && d.page == currentCanvasPage && d.ownerHash == mine && mine != 0) {
             canUndo = true;
             break;
         }
@@ -451,9 +467,11 @@ bool isRedoButtonPressed(int x, int y)
            y >= UNDO_REDO_BTN_Y - 2 && y <= UNDO_REDO_BTN_Y + UNDO_REDO_BTN_H + 2;
 }
 
-// 找出当前页最后一连续笔划 [start, end)
-static bool findLastStrokeOnPage(uint8_t page, size_t &start, size_t &end)
+// 找出当前页、指定笔主的最后一连续笔划 [start, end)
+static bool findLastStrokeOnPageByOwner(uint8_t page, uint16_t ownerHash, size_t &start, size_t &end)
 {
+    if (ownerHash == 0)
+        return false;
     const size_t n = allDrawingHistory.size();
     if (n == 0)
         return false;
@@ -462,7 +480,7 @@ static bool findLastStrokeOnPage(uint8_t page, size_t &start, size_t &end)
         const TouchData_t &d = allDrawingHistory[i];
         if (d.isReset)
             continue;
-        if (d.page == page) {
+        if (d.page == page && d.ownerHash == ownerHash) {
             endIdx = i;
             break;
         }
@@ -474,7 +492,7 @@ static bool findLastStrokeOnPage(uint8_t page, size_t &start, size_t &end)
     while (startIdx > 0) {
         const TouchData_t &cur = allDrawingHistory[startIdx];
         const TouchData_t &prev = allDrawingHistory[startIdx - 1];
-        if (prev.isReset || prev.page != page)
+        if (prev.isReset || prev.page != page || prev.ownerHash != ownerHash)
             break;
         unsigned long dt = (cur.timestamp >= prev.timestamp)
                                ? (cur.timestamp - prev.timestamp)
@@ -488,10 +506,11 @@ static bool findLastStrokeOnPage(uint8_t page, size_t &start, size_t &end)
     return true;
 }
 
-static bool extractLastStrokeOnPage(uint8_t page, std::vector<TouchData_t> &stroke)
+static bool extractLastStrokeOnPageByOwner(uint8_t page, uint16_t ownerHash,
+                                           std::vector<TouchData_t> &stroke)
 {
     size_t start = 0, end = 0;
-    if (!findLastStrokeOnPage(page, start, end))
+    if (!findLastStrokeOnPageByOwner(page, ownerHash, start, end))
         return false;
     stroke.clear();
     stroke.reserve(end - start);
@@ -512,10 +531,11 @@ static bool extractLastStrokeOnPage(uint8_t page, std::vector<TouchData_t> &stro
     return true;
 }
 
-void applyRemoteCanvasUndo(uint8_t page)
+void applyRemoteCanvasUndo(uint8_t page, const char *ownerId)
 {
+    uint16_t oh = deviceIdToOwnerHash(ownerId);
     std::vector<TouchData_t> discarded;
-    if (!extractLastStrokeOnPage(page, discarded))
+    if (!extractLastStrokeOnPageByOwner(page, oh, discarded))
         return;
     if (page == currentCanvasPage && currentUIState == UI_STATE_MAIN && !inCustomColorMode)
         paintCurrentCanvasPage();
@@ -526,8 +546,8 @@ void applyRemoteCanvasUndo(uint8_t page)
 void handleCanvasUndo()
 {
     std::vector<TouchData_t> stroke;
-    if (!extractLastStrokeOnPage(currentCanvasPage, stroke)) {
-        showStatusToast("无可撤销", 900);
+    if (!extractLastStrokeOnPageByOwner(currentCanvasPage, localOwnerHash(), stroke)) {
+        showStatusToast("无可撤销(仅本机)", 1200);
         drawUndoRedoButtons();
         return;
     }
@@ -535,6 +555,7 @@ void handleCanvasUndo()
         canvasRedoStack.erase(canvasRedoStack.begin());
     canvasRedoStack.push_back(std::move(stroke));
     broadcastCanvasPage(CANVAS_PAGE_ACT_UNDO, currentCanvasPage, canvasPageCount);
+    noteLocalDestructiveCanvasEdit();
     paintCurrentCanvasPage();
     drawUndoRedoButtons();
     showStatusToast("已撤销", 800);
@@ -549,7 +570,9 @@ void handleCanvasRedo()
     }
     std::vector<TouchData_t> stroke = std::move(canvasRedoStack.back());
     canvasRedoStack.pop_back();
-    for (const auto &d : stroke) {
+    const uint16_t mine = localOwnerHash();
+    for (auto &d : stroke) {
+        d.ownerHash = mine;
         allDrawingHistory.push_back(d);
         SyncMessage_t drawMsg;
         memset(&drawMsg, 0, sizeof(drawMsg));
@@ -1343,10 +1366,18 @@ void drawClearConfirmPopup()
     tft.drawRect(CONFIRM_POPUP_X + 1, CONFIRM_POPUP_Y + 1, CONFIRM_POPUP_W - 2, CONFIRM_POPUP_H - 2,
                  tft.color565(90, 100, 120));
 
-    const char *title = (clearConfirmKind == CLEAR_CONFIRM_PAGE) ? "清空本页" : "清空全部";
-    const char *hint = (clearConfirmKind == CLEAR_CONFIRM_PAGE)
-                           ? "仅清除当前页笔迹"
-                           : "所有页笔迹都会清除";
+    const char *title = "清空本页";
+    const char *hint = "仅清除当前页笔迹";
+    if (clearConfirmKind == CLEAR_CONFIRM_ALL) {
+        title = "清空全部";
+        hint = "所有页笔迹都会清除";
+    } else if (clearConfirmKind == CLEAR_CONFIRM_FLIP) {
+        title = "确认翻转";
+        hint = "画面转180度";
+    } else if (clearConfirmKind == CLEAR_CONFIRM_PAGE) {
+        title = "清空本页";
+        hint = "仅清除当前页笔迹";
+    }
 
     int titleW = cnTextWidth(title);
     cnDrawUtf8(tft, CONFIRM_POPUP_X + (CONFIRM_POPUP_W - titleW) / 2,
@@ -1363,8 +1394,10 @@ void drawClearConfirmPopup()
                CONFIRM_BTN_Y + 6, "取消", TFT_WHITE);
 
     // 确定
-    tft.fillRoundRect(CONFIRM_OK_X, CONFIRM_BTN_Y, CONFIRM_BTN_W, CONFIRM_BTN_H, 4,
-                      tft.color565(180, 48, 48));
+    uint16_t okBg = (clearConfirmKind == CLEAR_CONFIRM_FLIP)
+                        ? tft.color565(40, 120, 90)
+                        : tft.color565(180, 48, 48);
+    tft.fillRoundRect(CONFIRM_OK_X, CONFIRM_BTN_Y, CONFIRM_BTN_W, CONFIRM_BTN_H, 4, okBg);
     int okW = cnTextWidth("确定");
     cnDrawUtf8(tft, CONFIRM_OK_X + (CONFIRM_BTN_W - okW) / 2,
                CONFIRM_BTN_Y + 6, "确定", TFT_WHITE);
@@ -1374,7 +1407,7 @@ void showClearConfirm(ClearConfirmKind_t kind)
 {
     if (!isScreenOn || inCustomColorMode)
         return;
-    if (kind != CLEAR_CONFIRM_ALL && kind != CLEAR_CONFIRM_PAGE)
+    if (kind != CLEAR_CONFIRM_ALL && kind != CLEAR_CONFIRM_PAGE && kind != CLEAR_CONFIRM_FLIP)
         return;
     if (isCoffeePopupVisible || isProjectInfoPopupVisible)
         return;
@@ -1450,6 +1483,9 @@ bool handleClearConfirmTouch(int x, int y)
         } else if (kind == CLEAR_CONFIRM_PAGE) {
             currentUIState = UI_STATE_MAIN;
             handleCanvasPageClear();
+        } else if (kind == CLEAR_CONFIRM_FLIP) {
+            currentUIState = UI_STATE_MAIN;
+            handleCanvasFlip();
         } else {
             redrawMainScreen();
         }
@@ -1992,35 +2028,154 @@ static void drawRssiBars(int x, int y, int8_t rssi)
     }
 }
 
-// Simple WiFi icon (chevron arcs + dot)
-static void drawWifiIcon(int x, int y, int8_t rssi)
+// level: -1=未连接, 0=很差/高延迟, 1..3=弧段
+static int wifiLevelFromLatencyMs(unsigned long latMs, bool connected)
+{
+    if (!connected)
+        return -1;
+    if (latMs == 0)
+        return 2; // 已连但尚无延迟样本
+    if (latMs <= 60)
+        return 3;
+    if (latMs <= 150)
+        return 2;
+    if (latMs <= 350)
+        return 1;
+    return 0;
+}
+
+static unsigned long focusPeerLatencyMs(const PeerInfo_t *pinfo)
+{
+    if (!pinfo)
+        return 0;
+    unsigned long lat = pinfo->latencyMs;
+    unsigned long now = millis();
+    if (pinfo->lastSeenMs > 0 && now >= pinfo->lastSeenMs) {
+        unsigned long age = now - pinfo->lastSeenMs;
+        if (age > lat)
+            lat = age;
+    }
+    if (lat > 9999)
+        lat = 9999;
+    return lat;
+}
+
+// 真 WiFi 扇形图标：未连接灰+叉；已连接按延迟点亮弧
+static void drawWifiIconByLevel(int x, int y, int level)
+{
+    int cx = x + 11;
+    int cy = y + 15;
+    uint16_t onC = TFT_CYAN;
+    uint16_t offC = TFT_DARKGREY;
+    if (level < 0) {
+        onC = TFT_DARKGREY;
+        // 空心扇 + 红叉
+        tft.drawCircle(cx, cy - 6, 3, offC);
+        tft.drawCircle(cx, cy - 6, 6, offC);
+        tft.drawCircle(cx, cy - 6, 9, offC);
+        tft.fillCircle(cx, cy, 2, offC);
+        tft.drawLine(x + 2, y + 2, x + 20, y + 16, TFT_RED);
+        tft.drawLine(x + 3, y + 2, x + 21, y + 16, TFT_RED);
+        return;
+    }
+    if (level == 0)
+        onC = TFT_RED;
+    else if (level == 1)
+        onC = TFT_YELLOW;
+    else
+        onC = TFT_CYAN;
+
+    tft.fillCircle(cx, cy, 2, onC);
+    // 三层弧（用折线近似，比单线更“真”）
+    auto arc = [&](int rad, bool on) {
+        uint16_t c = on ? onC : offC;
+        for (int a = -60; a <= 60; a += 10) {
+            float r0 = (float)rad;
+            float r1 = (float)rad;
+            float a0 = (float)a * 0.0174533f;
+            float a1 = (float)(a + 10) * 0.0174533f;
+            int x0 = cx + (int)(r0 * sinf(a0));
+            int y0 = cy - 2 - (int)(r0 * cosf(a0));
+            int x1 = cx + (int)(r1 * sinf(a1));
+            int y1 = cy - 2 - (int)(r1 * cosf(a1));
+            tft.drawLine(x0, y0, x1, y1, c);
+            tft.drawLine(x0, y0 + 1, x1, y1 + 1, c);
+        }
+    };
+    arc(4, level >= 1);
+    arc(7, level >= 2);
+    arc(10, level >= 3);
+}
+
+// 左半 ESP-NOW 信号格 + 右半 WiFi（按延迟）；WiFi 未连接则右半打叉
+static void drawHybridLinkIcon(int x, int y, int8_t espRssi, int wifiLevel)
 {
     int level = 0;
-    if (rssi == 0)
+    if (espRssi == 0)
         level = 0;
-    else if (rssi >= -55)
+    else if (espRssi >= -55)
         level = 3;
-    else if (rssi >= -70)
+    else if (espRssi >= -65)
+        level = 3;
+    else if (espRssi >= -75)
         level = 2;
-    else if (rssi >= -85)
+    else if (espRssi >= -85)
         level = 1;
-    else
-        level = 0;
-    uint16_t onC = (level == 0) ? TFT_RED : ((level == 1) ? TFT_YELLOW : TFT_CYAN);
-    uint16_t offC = TFT_DARKGREY;
-    int cx = x + 10;
+    uint16_t barC = TFT_GREEN;
+    if (level <= 1)
+        barC = TFT_RED;
+    else if (level == 2)
+        barC = TFT_YELLOW;
+    for (int i = 0; i < 3; i++) {
+        int h = 3 + i * 3;
+        uint16_t c = (i < level) ? barC : TFT_DARKGREY;
+        tft.fillRect(x + i * 4, y + 12 - h, 3, h, c);
+    }
+    tft.drawFastVLine(x + 13, y + 1, 14, TFT_DARKGREY);
+    // 右半迷你 WiFi
+    int cx = x + 22;
     int cy = y + 14;
-    tft.fillCircle(cx, cy, 2, onC);
-    auto chev = [&](int w, int top, bool on) {
-        uint16_t c = on ? onC : offC;
-        tft.drawLine(cx - w, top + w / 2, cx, top, c);
-        tft.drawLine(cx, top, cx + w, top + w / 2, c);
-        tft.drawLine(cx - w, top + w / 2 + 1, cx, top + 1, c);
-        tft.drawLine(cx, top + 1, cx + w, top + w / 2 + 1, c);
+    if (wifiLevel < 0) {
+        tft.fillCircle(cx, cy, 1, TFT_DARKGREY);
+        tft.drawLine(cx - 4, y + 6, cx + 4, y + 14, TFT_RED);
+        return;
+    }
+    uint16_t onC = (wifiLevel == 0) ? TFT_RED : ((wifiLevel == 1) ? TFT_YELLOW : TFT_CYAN);
+    tft.fillCircle(cx, cy, 1, onC);
+    auto mini = [&](int rad, bool on) {
+        uint16_t c = on ? onC : TFT_DARKGREY;
+        tft.drawLine(cx - rad, cy - rad / 2, cx, cy - rad, c);
+        tft.drawLine(cx, cy - rad, cx + rad, cy - rad / 2, c);
     };
-    chev(4, y + 10, level >= 1);
-    chev(7, y + 6, level >= 2);
-    chev(10, y + 2, level >= 3);
+    mini(3, wifiLevel >= 1);
+    mini(5, wifiLevel >= 2);
+    mini(7, wifiLevel >= 3);
+}
+
+static void drawLinkModeIcon(int x, int y, int8_t espRssi, int wifiLevel)
+{
+    uint8_t mode = getLinkMode();
+    if (mode == LINK_MODE_WIFI_ONLY)
+        drawWifiIconByLevel(x, y, wifiLevel);
+    else if (mode == LINK_MODE_DUAL || mode == LINK_MODE_WIFI_ON)
+        drawHybridLinkIcon(x, y, espRssi, wifiLevel);
+    else
+        drawRssiBars(x, y + 2, espRssi);
+}
+
+static const char *linkModeIconLabel(int wifiLevel)
+{
+    uint8_t mode = getLinkMode();
+    if (mode == LINK_MODE_WIFI_ONLY) {
+        if (wifiLevel < 0)
+            return "off";
+        return "WiFi";
+    }
+    if (mode == LINK_MODE_DUAL)
+        return "E+W";
+    if (mode == LINK_MODE_WIFI_ON)
+        return "E/W";
+    return "ESP";
 }
 
 void paintCurrentCanvasPage()
@@ -2030,10 +2185,10 @@ void paintCurrentCanvasPage()
         return;
     }
     tft.fillScreen(TFT_BLACK);
-    // 重放当前页笔迹
-    TS_Point lastPt = {0, 0, 0};
-    unsigned long lastTs = 0;
-    uint32_t lastCol = 0;
+
+    // 先按时间序展开：橡皮只清掉同笔主墨迹，再绘制可见点
+    std::vector<TouchData_t> visible;
+    visible.reserve(256);
     const size_t n = allDrawingHistory.size();
     for (size_t i = 0; i < n; i++) {
         const TouchData_t &d = allDrawingHistory[i];
@@ -2041,21 +2196,39 @@ void paintCurrentCanvasPage()
             continue;
         if (d.page != currentCanvasPage)
             continue;
-        int mapX = d.x, mapY = d.y;
         if (d.color == TFT_BLACK) {
             int r = resolveEraserRadius(d.brushR);
-            if (lastPt.z != 0 && lastCol == TFT_BLACK &&
-                (d.timestamp - lastTs <= TOUCH_STROKE_INTERVAL))
-                applyEraserSegment(lastPt.x, lastPt.y, mapX, mapY, r);
-            else
-                applyEraserDot(mapX, mapY, r);
-        } else {
-            int r = resolveBrushRadius(d.brushR);
-            if (d.timestamp - lastTs > TOUCH_STROKE_INTERVAL || lastPt.z == 0 || lastCol == TFT_BLACK)
-                applyBrushDot(mapX, mapY, d.color, r);
-            else
-                applyBrushSegment(lastPt.x, lastPt.y, mapX, mapY, d.color, r);
+            const long r2 = (long)r * (long)r;
+            uint16_t oh = d.ownerHash;
+            if (oh == 0)
+                continue; // 无归属的旧橡皮忽略，避免误擦他人
+            std::vector<TouchData_t> kept;
+            kept.reserve(visible.size());
+            for (const auto &p : visible) {
+                if (p.ownerHash == oh && p.color != TFT_BLACK) {
+                    long dx = (long)p.x - (long)d.x;
+                    long dy = (long)p.y - (long)d.y;
+                    if (dx * dx + dy * dy <= r2)
+                        continue;
+                }
+                kept.push_back(p);
+            }
+            visible.swap(kept);
+            continue;
         }
+        visible.push_back(d);
+    }
+
+    TS_Point lastPt = {0, 0, 0};
+    unsigned long lastTs = 0;
+    uint32_t lastCol = 0;
+    for (const auto &d : visible) {
+        int mapX = d.x, mapY = d.y;
+        int r = resolveBrushRadius(d.brushR);
+        if (d.timestamp - lastTs > TOUCH_STROKE_INTERVAL || lastPt.z == 0 || lastCol == TFT_BLACK)
+            applyBrushDot(mapX, mapY, d.color, r);
+        else
+            applyBrushSegment(lastPt.x, lastPt.y, mapX, mapY, d.color, r);
         lastPt = {mapX, mapY, 1};
         lastTs = d.timestamp;
         lastCol = d.color;
@@ -2282,7 +2455,7 @@ void handleCanvasPageClear()
     showStatusToast(tip, 1200);
 }
 
-void applyRemoteCanvasPage(uint8_t action, uint8_t page, uint8_t pageCount)
+void applyRemoteCanvasPage(uint8_t action, uint8_t page, uint8_t pageCount, const char *senderId)
 {
     if (action == CANVAS_PAGE_ACT_CREATE) {
         if (pageCount > canvasPageCount && pageCount <= CANVAS_MAX_PAGES)
@@ -2323,7 +2496,7 @@ void applyRemoteCanvasPage(uint8_t action, uint8_t page, uint8_t pageCount)
         return;
     }
     if (action == CANVAS_PAGE_ACT_UNDO) {
-        applyRemoteCanvasUndo(page);
+        applyRemoteCanvasUndo(page, senderId);
         if (currentUIState == UI_STATE_MAIN && !inCustomColorMode)
             drawUndoRedoButtons();
         return;
@@ -2345,19 +2518,22 @@ void drawSignalStrengthInfo()
 
     tft.fillRect(SIGNAL_INFO_X, SIGNAL_INFO_Y, SIGNAL_INFO_W, SIGNAL_INFO_H, TFT_BLACK);
 
-    if (peerInfoMap.empty()) {
+    const bool wifiOn = linkModeWifiEnabled();
+    const bool wifiUp = wifiOn && wifiIsConnected();
+    int wifiLv = wifiLevelFromLatencyMs(0, wifiUp);
+
+    auto drawEmptyLinkHint = [&]() {
+        wifiLv = wifiLevelFromLatencyMs(wifiUp ? 100UL : 0UL, wifiUp);
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.setTextDatum(TL_DATUM);
         tft.setTextFont(1);
         tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y);
-        if (transportUsesWifiIcon() || linkModeWifiEnabled()) {
-            tft.print("WiFi");
-            drawWifiIcon(SIGNAL_INFO_X + 2, SIGNAL_INFO_Y + 8, 0);
-        } else {
-            tft.print("Sig");
-            tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 10);
-            tft.print("tap");
-        }
+        tft.print(linkModeIconLabel(wifiLv));
+        drawLinkModeIcon(SIGNAL_INFO_X + 1, SIGNAL_INFO_Y + 8, 0, wifiLv);
+    };
+
+    if (peerInfoMap.empty()) {
+        drawEmptyLinkHint();
         return;
     }
 
@@ -2369,18 +2545,7 @@ void drawSignalStrengthInfo()
             peerMacs.push_back(kv.first);
     }
     if (peerMacs.empty()) {
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.setTextDatum(TL_DATUM);
-        tft.setTextFont(1);
-        tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y);
-        if (linkModeIsWifiOnly()) {
-            tft.print("WiFi");
-            drawWifiIcon(SIGNAL_INFO_X + 2, SIGNAL_INFO_Y + 8, 0);
-        } else {
-            tft.print("Sig");
-            tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 10);
-            tft.print("tap");
-        }
+        drawEmptyLinkHint();
         return;
     }
 
@@ -2416,6 +2581,8 @@ void drawSignalStrengthInfo()
     const PeerInfo_t &pinfo = it->second;
     const char *id = (pinfo.deviceId[0]) ? pinfo.deviceId : "Peer";
     int8_t rssi = pinfo.rssi;
+    unsigned long latMs = focusPeerLatencyMs(&pinfo);
+    wifiLv = wifiLevelFromLatencyMs(latMs, wifiUp);
 
     // 轮换到另一台时顶部短暂提示
     if (rotated) {
@@ -2424,20 +2591,30 @@ void drawSignalStrengthInfo()
         showStatusToast(tip, 1800);
     }
 
-    // 颜色：强绿 / 中黄 / 弱红
+    // ID 颜色：WiFi 模式看延迟，ESP 模式看 RSSI
     uint16_t color = TFT_GREEN;
-    if (rssi < -80)
-        color = TFT_RED;
-    else if (rssi < -70)
-        color = TFT_YELLOW;
-    else if (rssi == 0)
-        color = TFT_DARKGREY; // 尚未收到有效 RSSI
+    if (getLinkMode() == LINK_MODE_WIFI_ONLY) {
+        if (wifiLv < 0)
+            color = TFT_DARKGREY;
+        else if (wifiLv == 0)
+            color = TFT_RED;
+        else if (wifiLv == 1)
+            color = TFT_YELLOW;
+        else
+            color = TFT_CYAN;
+    } else {
+        if (rssi < -80)
+            color = TFT_RED;
+        else if (rssi < -70)
+            color = TFT_YELLOW;
+        else if (rssi == 0)
+            color = TFT_DARKGREY;
+    }
 
     tft.setTextDatum(TL_DATUM);
     tft.setTextFont(1);
     tft.setTextColor(color, TFT_BLACK);
     tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y);
-    // 标识过长则截断
     char idShort[7];
     if (isPrivateCanvasActive()) {
         strncpy(idShort, "PRIV", 6);
@@ -2449,11 +2626,7 @@ void drawSignalStrengthInfo()
     }
     tft.print(idShort);
 
-    // ESP-NOW → signal bars；WiFi/双并发 → WiFi 图标
-    if (transportUsesWifiIcon())
-        drawWifiIcon(SIGNAL_INFO_X + 2, SIGNAL_INFO_Y + 8, rssi);
-    else
-        drawRssiBars(SIGNAL_INFO_X + 2, SIGNAL_INFO_Y + 10, rssi);
+    drawLinkModeIcon(SIGNAL_INFO_X + 1, SIGNAL_INFO_Y + 8, rssi, wifiLv);
 
     if (peerMacs.size() > 1 && !isPrivateCanvasActive()) {
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
@@ -2463,14 +2636,17 @@ void drawSignalStrengthInfo()
         tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
         tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
         tft.print("tap");
-    } else if (transportUsesWifiIcon()) {
-        tft.setTextColor(TFT_CYAN, TFT_DARKGREY);
+    } else if (getLinkMode() == LINK_MODE_WIFI_ONLY && wifiUp && latMs > 0) {
+        tft.setTextColor(color, TFT_BLACK);
         tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
-        tft.print("WiFi");
+        if (latMs >= 1000)
+            tft.printf("%lus", (unsigned long)(latMs / 1000UL));
+        else
+            tft.printf("%lu", latMs);
     } else {
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
-        tft.print("ESP");
+        tft.print(linkModeIconLabel(wifiLv));
     }
 }
 
@@ -2851,6 +3027,82 @@ bool applyEraserSegment(int x0, int y0, int x1, int y1, int r)
     if (applyEraserDot(x1, y1, r))
         hitUi = true;
     return hitUi;
+}
+
+bool eraseOwnerInkNear(int cx, int cy, int r, uint8_t page, uint16_t ownerHash)
+{
+    if (ownerHash == 0)
+        return false;
+    r = clampEraserRadius(r);
+    const long r2 = (long)r * (long)r;
+    bool any = false;
+    std::vector<TouchData_t> kept;
+    const size_t n = allDrawingHistory.size();
+    kept.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        const TouchData_t &d = allDrawingHistory[i];
+        // 只删该笔主、非橡皮标记、当前页上的实心点
+        if (!d.isReset && d.color != TFT_BLACK && d.page == page && d.ownerHash == ownerHash) {
+            long dx = (long)d.x - (long)cx;
+            long dy = (long)d.y - (long)cy;
+            if (dx * dx + dy * dy <= r2) {
+                any = true;
+                continue;
+            }
+        }
+        kept.push_back(d);
+    }
+    if (!any)
+        return false;
+    allDrawingHistory.clear();
+    for (const auto &d : kept)
+        allDrawingHistory.push_back(d);
+    return true;
+}
+
+bool eraseOwnerInkSegment(int x0, int y0, int x1, int y1, int r, uint8_t page, uint16_t ownerHash)
+{
+    r = clampEraserRadius(r);
+    int dx = x1 - x0;
+    int dy = y1 - y0;
+    int adx = dx < 0 ? -dx : dx;
+    int ady = dy < 0 ? -dy : dy;
+    int steps = adx > ady ? adx : ady;
+    bool any = false;
+    if (steps <= 0)
+        return eraseOwnerInkNear(x1, y1, r, page, ownerHash);
+    int stride = r / 2;
+    if (stride < 1)
+        stride = 1;
+    for (int i = 0; i <= steps; i += stride) {
+        int x = x0 + (int)((long)dx * i / steps);
+        int y = y0 + (int)((long)dy * i / steps);
+        if (eraseOwnerInkNear(x, y, r, page, ownerHash))
+            any = true;
+    }
+    if (eraseOwnerInkNear(x1, y1, r, page, ownerHash))
+        any = true;
+    return any;
+}
+
+static unsigned long lastOwnerErasePaintMs = 0;
+
+void paintCanvasAfterOwnerErase()
+{
+    unsigned long now = millis();
+    if (now - lastOwnerErasePaintMs < 45UL)
+        return;
+    lastOwnerErasePaintMs = now;
+    if (currentUIState == UI_STATE_MAIN && !inCustomColorMode)
+        paintCurrentCanvasPage();
+    else
+        pendingCanvasRedrawAfterChat = true;
+}
+
+void forcePaintCanvasAfterOwnerErase()
+{
+    lastOwnerErasePaintMs = 0;
+    paintCanvasAfterOwnerErase();
 }
 
 bool safeEraserFill(int cx, int cy, int r)
