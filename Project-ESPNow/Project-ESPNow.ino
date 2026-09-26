@@ -29,6 +29,7 @@
 // 2026.9.26e: 禁加入刷屏；聊天中不叠 restore；修误触发同步；音节级大词库+标点。
 // 2026.9.26f: 信号差→恢复后自动全量重同步画面，补齐断续笔迹。
 // 2026.9.26g: 顶部通知更扁；5分钟无操作自动息屏，触摸唤醒。
+// 2026.9.26h: 右下「翻」按钮屏幕 180° 翻转（记忆 NVS）。
 
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
@@ -103,7 +104,7 @@ void setup()
     // 2. 初始化硬件接口 (SPI, 触摸屏, TFT) —— 立刻清屏，避免白屏
     initTouchSPI();
     tft.init();
-    tft.setRotation(1);
+    loadScreenRotation(); // 应用保存的正向/翻转，并同步触摸
     tft.fillScreen(TFT_BLACK);
 
     // 3. 初始化 WiFi 和 ESP-NOW

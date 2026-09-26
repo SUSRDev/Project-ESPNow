@@ -389,6 +389,14 @@ void handleLocalTouch() {
                             return;
                         }
 
+                        if (isCanvasFlipPressed(mapX, mapY)) {
+                            if (mainRising && !mainUiPressConsumed) {
+                                mainUiPressConsumed = true;
+                                handleCanvasFlip();
+                            }
+                            return;
+                        }
+
                         if (isCanvasPageClearPressed(mapX, mapY)) {
                             if (mainRising && !mainUiPressConsumed) {
                                 mainUiPressConsumed = true;

@@ -13,6 +13,7 @@
 #include <Preferences.h>
 #include "cn_text.h"
 #include <vector>
+#include <XPT2046_Touchscreen.h>
 
 static void loadChatHistory();
 static void saveChatHistory();
@@ -20,6 +21,8 @@ static void clearChatHistoryPersistent();
 
 // 来自 Project-ESPNow.ino 的外部变量
 extern SPIClass mySpi; // SPI对象
+extern XPT2046_Touchscreen ts;
+extern TFT_eSPI tft;
 
 // --- 全局 UI 状态变量 (在此定义) ---
 UIState_t currentUIState = UI_STATE_MAIN; // 当前 UI 状态
@@ -72,9 +75,10 @@ int blueValue = 255;
 uint16_t *savedScreenBuffer = nullptr;
 
 // --- 来自其他模块/主 .ino 文件的 Extern 变量 ---
-extern TFT_eSPI tft;    // 定义于 Project-ESPNow.ino
 extern bool isScreenOn; // 来自 power_manager 模块 (通过 ui_manager.h 间接包含 power_manager.h)
 // lastLocalPoint 和 lastLocalTouchTime 是 touch_handler 模块的内部状态, 不应在此 extern 或修改
+
+static uint8_t screenRotation = SCREEN_ROT_DEFAULT;
 
 // macSet, allDrawingHistory, relativeBootTimeOffset, peerInfoMap 已在 ui_manager.h 中 extern 声明
 // replayAllDrawings() 已在 esp_now_handler.h 中声明
@@ -1837,11 +1841,17 @@ void drawCanvasPageButtons()
 {
     if (currentUIState != UI_STATE_MAIN || inCustomColorMode)
         return;
+    tft.setTextDatum(MC_DATUM);
+    // 屏幕翻转（C 左侧）
+    tft.fillRect(CANVAS_FLIP_X, CANVAS_PAGE_BTN_Y, CANVAS_PAGE_BTN_W, CANVAS_PAGE_BTN_H,
+                 screenRotation == SCREEN_ROT_FLIPPED ? tft.color565(40, 120, 90)
+                                                      : tft.color565(50, 70, 100));
+    cnDrawUtf8(tft, CANVAS_FLIP_X + (CANVAS_PAGE_BTN_W - cnTextWidth("翻")) / 2,
+               CANVAS_PAGE_BTN_Y + 1, "翻", TFT_WHITE);
     // 清当前页（不删页、不清其它页）
     tft.fillRect(CANVAS_PAGE_CLEAR_X, CANVAS_PAGE_BTN_Y, CANVAS_PAGE_BTN_W, CANVAS_PAGE_BTN_H,
                  tft.color565(140, 40, 40));
     tft.setTextColor(TFT_WHITE);
-    tft.setTextDatum(MC_DATUM);
     tft.drawString("C", CANVAS_PAGE_CLEAR_X + CANVAS_PAGE_BTN_W / 2,
                    CANVAS_PAGE_BTN_Y + CANVAS_PAGE_BTN_H / 2, 1);
     // 上一页
@@ -1888,6 +1898,55 @@ bool isCanvasPageClearPressed(int x, int y)
         return false;
     return x >= CANVAS_PAGE_CLEAR_X && x <= CANVAS_PAGE_CLEAR_X + CANVAS_PAGE_BTN_W &&
            y >= CANVAS_PAGE_BTN_Y && y <= CANVAS_PAGE_BTN_Y + CANVAS_PAGE_BTN_H;
+}
+
+bool isCanvasFlipPressed(int x, int y)
+{
+    if (currentUIState != UI_STATE_MAIN || inCustomColorMode)
+        return false;
+    return x >= CANVAS_FLIP_X && x <= CANVAS_FLIP_X + CANVAS_PAGE_BTN_W &&
+           y >= CANVAS_PAGE_BTN_Y && y <= CANVAS_PAGE_BTN_Y + CANVAS_PAGE_BTN_H;
+}
+
+uint8_t getScreenRotation()
+{
+    return screenRotation;
+}
+
+static void applyDisplayRotation(uint8_t rot)
+{
+    if (rot != SCREEN_ROT_DEFAULT && rot != SCREEN_ROT_FLIPPED)
+        rot = SCREEN_ROT_DEFAULT;
+    screenRotation = rot;
+    tft.setRotation(screenRotation);
+    ts.setRotation(screenRotation);
+}
+
+void loadScreenRotation()
+{
+    uint8_t rot = SCREEN_ROT_DEFAULT;
+    Preferences p;
+    if (p.begin(DEVICE_ID_PREF_NAMESPACE, true)) {
+        rot = p.getUChar(SCREEN_ROT_PREF_KEY, SCREEN_ROT_DEFAULT);
+        p.end();
+    }
+    applyDisplayRotation(rot);
+}
+
+void handleCanvasFlip()
+{
+    uint8_t next = (screenRotation == SCREEN_ROT_DEFAULT) ? SCREEN_ROT_FLIPPED : SCREEN_ROT_DEFAULT;
+    applyDisplayRotation(next);
+    Preferences p;
+    if (p.begin(DEVICE_ID_PREF_NAMESPACE, false)) {
+        p.putUChar(SCREEN_ROT_PREF_KEY, screenRotation);
+        p.end();
+    }
+    if (currentUIState == UI_STATE_MAIN && !inCustomColorMode)
+        paintCurrentCanvasPage();
+    else
+        redrawMainScreen();
+    showStatusToast(screenRotation == SCREEN_ROT_FLIPPED ? "已翻转" : "已正向", 1000);
 }
 
 void handleCanvasPagePrev()
@@ -2344,9 +2403,9 @@ bool eraserOverlapsUi(int cx, int cy, int r)
         circleHitsRect(cx, cy, r, SCREENSHOT_BUTTON_X - 2, SCREENSHOT_BUTTON_Y - 2,
                        SCREENSHOT_BUTTON_W + 4, SCREENSHOT_BUTTON_H + 4))
         return true;
-    // 画布翻页 / 清页按钮
-    if (circleHitsRect(cx, cy, r, CANVAS_PAGE_CLEAR_X - 2, CANVAS_PAGE_BTN_Y - 2,
-                       CANVAS_PAGE_BTN_W * 3 + 8, CANVAS_PAGE_BTN_H + 4))
+    // 画布翻页 / 清页 / 翻转按钮（翻 C < >）
+    if (circleHitsRect(cx, cy, r, CANVAS_FLIP_X - 2, CANVAS_PAGE_BTN_Y - 2,
+                       CANVAS_PAGE_BTN_W * 4 + 10, CANVAS_PAGE_BTN_H + 4))
         return true;
     // 橡皮擦滑块 / +/-
     if (isEraserSliderVisible) {
