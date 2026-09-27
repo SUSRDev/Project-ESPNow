@@ -1,0 +1,34 @@
+---
+description: 旧板 Project-ESPNow 与新板 Project-ESPNow-ZLX 必须同步更新
+alwaysApply: true
+---
+
+# 双设备同步（强制）
+
+本仓库有两套并行工程，用户要求**任何功能/修复都两边一起改**：
+
+| 设备 | 目录 | 屏 |
+|---|---|---|
+| 旧板 | `Project-ESPNow/` | ILI9341 |
+| 新板 ZLX | `Project-ESPNow-ZLX/` | ST7789 |
+
+## 必须遵守
+
+1. 用户提需求时，默认同时改 `Project-ESPNow` **和** `Project-ESPNow-ZLX`，不要只改一边。
+2. 共享逻辑（游戏、大厅、聊天、ESP-NOW、字体数据等）两边行为保持一致。
+3. **不要**把板级差异抹平：
+   - `User_Setup.h`（驱动/反相/SPI）
+   - `src/config.h`（如 `ZLX_TOUCH_MIRROR_ON_FLIP`）
+   - `*.ino` 里显示初始化（如 `invertDisplay`）
+   - 触摸坐标映射里仅 ZLX 需要的镜像逻辑
+4. 改完后若两边可共享文件内容本应相同，可用：
+   - `tools/sync-boards.ps1 -From new` 或 `-From old`
+   - 半共享大文件需 `-ForceLogic`，覆盖后核对板级差异
+5. 烧录换板用根目录 `switch-device.bat`（或 `tools/switch-device.ps1 new|old`），先切 TFT_eSPI 的 `User_Setup.h` 再打开对应 `.ino`。
+
+## 改动检查清单
+
+- [ ] `Project-ESPNow` 已改
+- [ ] `Project-ESPNow-ZLX` 已改
+- [ ] 板级文件未被错误覆盖
+- [ ] 需要时已提示用户跑 `switch-device.bat` 再烧录

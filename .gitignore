@@ -11,6 +11,9 @@ build/
 Project-ESPNow/tools/_*.py
 Project-ESPNow/tools/_*.txt
 Project-ESPNow/tools/miss.txt
+Project-ESPNow-ZLX/tools/_*.py
+Project-ESPNow-ZLX/tools/_*.txt
+Project-ESPNow-ZLX/tools/miss.txt
 __pycache__/
 *.pyc
 

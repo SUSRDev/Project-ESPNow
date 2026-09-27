@@ -1270,7 +1270,7 @@ void drawGameLobby()
         tft.setTextColor(items[i].accent, tft.color565(22, 28, 42));
         tft.drawString(">", SCREEN_WIDTH - 28, y + 14, 2);
     }
-    // 上下翻页按钮
+    // 上下翻页按钮（电阻屏拖动不稳时的可靠入口）
     tft.fillRoundRect(8, SCREEN_HEIGHT - 26, 70, 22, 4, tft.color565(40, 70, 110));
     cnDrawUtf8(tft, 26, SCREEN_HEIGHT - 22, "上翻", TFT_WHITE);
     tft.fillRoundRect(86, SCREEN_HEIGHT - 26, 70, 22, 4, tft.color565(40, 70, 110));
@@ -2627,6 +2627,7 @@ bool handleGameArcadeTouch(int x, int y)
                 hideGameArcade();
                 return true;
             }
+            // 顶栏按钮
             if (y >= 4 && y <= 22) {
                 if (x >= 148 && x <= 192) {
                     arcadeView = ARCADE_MY_STATS;
@@ -2642,12 +2643,13 @@ bool handleGameArcadeTouch(int x, int y)
                     return true;
                 }
             }
+            // 上翻 / 下翻
             if (y >= SCREEN_HEIGHT - 28) {
                 if (x < 80) {
                     lobbyScrollY -= LOBBY_ITEM_H;
                     if (lobbyScrollY < 0)
                         lobbyScrollY = 0;
-                    lobbyDidDrag = true;
+                    lobbyDidDrag = true; // 防止松手误点进游戏
                     drawGameLobby();
                 } else if (x < 160) {
                     lobbyScrollY += LOBBY_ITEM_H;
@@ -2661,6 +2663,7 @@ bool handleGameArcadeTouch(int x, int y)
             return true;
         }
 
+        // 按住拖动
         if (lobbyDragStartY >= 0) {
             int dy = lobbyDragStartY - y;
             int dx = lobbyDragStartX - x;
@@ -2993,6 +2996,7 @@ void gameArcadeTouchReleased()
         lobbyDragStartY = -1;
         lobbyDidDrag = false;
         arcadeFingerDown = false;
+        // 拖动结束补一帧，对齐节流期间未画完的位置
         if (wasDrag) {
             drawGameLobby();
             return;
@@ -3013,7 +3017,7 @@ void gameArcadeTouchReleased()
                 sendGameRecruit(kinds[idx]);
                 return;
             }
-            // 仅右侧 > 进入；点条目正文只用于滑动
+            // 仅右侧 > 进入；点条目正文只用于滑动，避免误进游戏
             if (x < SCREEN_WIDTH - 40 || y < rowY + 6 || y > rowY + LOBBY_ITEM_H - 6)
                 return;
             if (idx == 0)

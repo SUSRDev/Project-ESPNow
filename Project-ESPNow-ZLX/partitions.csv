@@ -1,0 +1,6 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# 3MB 应用分区（No OTA），给中文字库留足空间
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x300000,
+spiffs,   data, spiffs,  0x310000,0xF0000,

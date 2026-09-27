@@ -39,6 +39,7 @@ static bool mainUiFingerDown = false;
 static bool mainUiPressConsumed = false;
 static bool clearConfirmFingerDown = false;
 static bool screenOffTouchDown = false;
+// 娱乐大厅滑动时电阻屏易抖空，抬手需连续确认几次
 static uint8_t arcadeReleaseHold = 0;
 
 // --- 函数实现 ---
@@ -66,6 +67,21 @@ void initSDSPI() {
 void touchHandlerInit() {
     // 如果将来需要任何触摸相关的特定初始化，则为占位符
     // 例如：ts.setThreshold(某个值);
+}
+
+// 原始触摸 ADC → 屏幕坐标（处理 ZLX 翻转镜像）
+static void mapTouchToScreen(float rx, float ry, int &mapX, int &mapY)
+{
+    mapX = map((int)rx, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCREEN_WIDTH - 1);
+    mapY = map((int)ry, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCREEN_HEIGHT - 1);
+    mapX = constrain(mapX, 0, SCREEN_WIDTH - 1);
+    mapY = constrain(mapY, 0, SCREEN_HEIGHT - 1);
+#if ZLX_TOUCH_MIRROR_ON_FLIP
+    if (getScreenRotation() == SCREEN_ROT_FLIPPED) {
+        mapX = SCREEN_WIDTH - 1 - mapX;
+        mapY = SCREEN_HEIGHT - 1 - mapY;
+    }
+#endif
 }
 
 // 触摸点平均值计算
@@ -177,8 +193,8 @@ void handleLocalTouch() {
         if (isGameInviteDialogVisible()) {
             xy1 = averageXY();
             if (!xy1.fly) {
-                int mapX = map(xy1.x, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCREEN_WIDTH);
-                int mapY = map(xy1.y, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCREEN_HEIGHT);
+                int mapX, mapY;
+                mapTouchToScreen(xy1.x, xy1.y, mapX, mapY);
                 handleGameInviteTouch(mapX, mapY);
                 lastLocalPoint.z = 0;
                 return;
@@ -186,8 +202,8 @@ void handleLocalTouch() {
         } else if (isPrivInviteDialogVisible()) {
             xy1 = averageXY();
             if (!xy1.fly) {
-                int mapX = map(xy1.x, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCREEN_WIDTH);
-                int mapY = map(xy1.y, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCREEN_HEIGHT);
+                int mapX, mapY;
+                mapTouchToScreen(xy1.x, xy1.y, mapX, mapY);
                 handlePrivInviteTouch(mapX, mapY);
                 lastLocalPoint.z = 0;
                 return;
@@ -197,8 +213,8 @@ void handleLocalTouch() {
             if (!xy1.fly) {
                 if (!clearConfirmFingerDown) {
                     clearConfirmFingerDown = true;
-                    int mapX = map(xy1.x, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCREEN_WIDTH);
-                    int mapY = map(xy1.y, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCREEN_HEIGHT);
+                    int mapX, mapY;
+                mapTouchToScreen(xy1.x, xy1.y, mapX, mapY);
                     handleClearConfirmTouch(mapX, mapY);
                 }
                 lastLocalPoint.z = 0;
@@ -221,13 +237,12 @@ void handleLocalTouch() {
         }
 
         // 娱乐界面优先：电阻屏滑动时 averageXY 易失败，改用单点快速采样
+        // touched() 已确认接触，不再二次卡 z 阈值（滑动中压力常远低于落点）
         if (currentUIState == UI_STATE_ARCADE) {
             arcadeReleaseHold = 0;
             TS_Point p = ts.getPoint();
-            int mapX = map(p.x, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCREEN_WIDTH);
-            int mapY = map(p.y, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCREEN_HEIGHT);
-            mapX = constrain(mapX, 0, SCREEN_WIDTH - 1);
-            mapY = constrain(mapY, 0, SCREEN_HEIGHT - 1);
+            int mapX, mapY;
+            mapTouchToScreen((float)p.x, (float)p.y, mapX, mapY);
             handleGameArcadeTouch(mapX, mapY);
             return;
         }
@@ -238,8 +253,8 @@ void handleLocalTouch() {
 
         if (!xy1.fly) { // 如果触摸点有效
             // 将原始触摸坐标映射到屏幕坐标
-            int mapX = map(x1, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCREEN_WIDTH);
-            int mapY = map(y1, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCREEN_HEIGHT);
+            int mapX, mapY;
+                mapTouchToScreen(x1, y1, mapX, mapY);
 
             // 根据当前 UI 状态处理触摸事件
             switch (currentUIState) {
@@ -605,6 +620,7 @@ void handleLocalTouch() {
         if (currentUIState == UI_STATE_SETTINGS)
             settingsTouchReleased();
         if (currentUIState == UI_STATE_ARCADE) {
+            // 滑动中途压力抖动会短暂 !touched，连续 3 次再抬手，避免拖动被掐断
             if (arcadeReleaseHold < 3) {
                 if (++arcadeReleaseHold >= 3)
                     gameArcadeTouchReleased();
