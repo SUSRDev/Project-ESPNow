@@ -2537,9 +2537,8 @@ void drawSignalStrengthInfo()
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.setTextDatum(TL_DATUM);
         tft.setTextFont(1);
-        tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y);
-        tft.print(linkModeIconLabel(wifiLv));
-        drawLinkModeIcon(SIGNAL_INFO_X + 1, SIGNAL_INFO_Y + 8, 0, wifiLv);
+        cnDrawUtf8(tft, SIGNAL_INFO_X, SIGNAL_INFO_Y, "暂无", TFT_DARKGREY);
+        drawLinkModeIcon(SIGNAL_INFO_X + 1, SIGNAL_INFO_Y + 14, 0, wifiLv);
     };
 
     if (peerInfoMap.empty()) {
@@ -2593,14 +2592,13 @@ void drawSignalStrengthInfo()
     int8_t rssi = pinfo.rssi;
     wifiLv = wifiLevelFromLink(wifiUp, &pinfo);
 
-    // 轮换到另一台时顶部短暂提示
     if (rotated) {
-        char tip[40];
-        snprintf(tip, sizeof(tip), "查看 %s 信号", id);
-        showStatusToast(tip, 1800);
+        char tip[48];
+        snprintf(tip, sizeof(tip), "信号 %s", id);
+        showStatusToast(tip, 1600);
     }
 
-    // ID 颜色：WiFi 模式看本机 AP 质量；ESP 模式看对端 RSSI
+    // 名称颜色按信号质量
     uint16_t color = TFT_GREEN;
     if (getLinkMode() == LINK_MODE_WIFI_ONLY ||
         ((getLinkMode() == LINK_MODE_DUAL || getLinkMode() == LINK_MODE_WIFI_ON) && wifiUp)) {
@@ -2613,53 +2611,52 @@ void drawSignalStrengthInfo()
         else
             color = TFT_CYAN;
     } else {
-        if (rssi < -80)
+        if (rssi == 0)
+            color = TFT_DARKGREY;
+        else if (rssi < -80)
             color = TFT_RED;
         else if (rssi < -70)
             color = TFT_YELLOW;
-        else if (rssi == 0)
-            color = TFT_DARKGREY;
     }
 
+    // 上行：当前轮换到的对端中文名（与下方信号对应）
+    if (isPrivateCanvasActive()) {
+        cnDrawUtf8Ellipsis(tft, SIGNAL_INFO_X, SIGNAL_INFO_Y, "私密", TFT_MAGENTA,
+                           SIGNAL_INFO_W, TFT_BLACK, false);
+    } else {
+        cnDrawUtf8Ellipsis(tft, SIGNAL_INFO_X, SIGNAL_INFO_Y, id, color,
+                           SIGNAL_INFO_W, TFT_BLACK, false);
+    }
+
+    // 中行：该对端的信号格
+    drawLinkModeIcon(SIGNAL_INFO_X + 1, SIGNAL_INFO_Y + 14, rssi, wifiLv);
+
+    // 下行：该对端 RSSI（dBm），不再显示链路标签 ESP
+    char sub[14];
+    uint16_t subCol = color;
+    if (isPrivateCanvasActive()) {
+        snprintf(sub, sizeof(sub), "tap");
+        subCol = TFT_MAGENTA;
+    } else if (rssi != 0) {
+        snprintf(sub, sizeof(sub), "%d", (int)rssi);
+    } else if (wifiUp) {
+        int32_t ap = wifiApRssi();
+        if (ap != 0)
+            snprintf(sub, sizeof(sub), "%d", (int)ap);
+        else
+            snprintf(sub, sizeof(sub), "WiFi");
+    } else if (peerMacs.size() > 1) {
+        snprintf(sub, sizeof(sub), "%u/%u", (unsigned)(cur + 1), (unsigned)peerMacs.size());
+        subCol = TFT_DARKGREY;
+    } else {
+        snprintf(sub, sizeof(sub), "--");
+        subCol = TFT_DARKGREY;
+    }
     tft.setTextDatum(TL_DATUM);
     tft.setTextFont(1);
-    tft.setTextColor(color, TFT_BLACK);
-    tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y);
-    char idShort[7];
-    if (isPrivateCanvasActive()) {
-        strncpy(idShort, "PRIV", 6);
-        idShort[6] = '\0';
-        tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
-    } else {
-        strncpy(idShort, id, 6);
-        idShort[6] = '\0';
-    }
-    tft.print(idShort);
-
-    drawLinkModeIcon(SIGNAL_INFO_X + 1, SIGNAL_INFO_Y + 8, rssi, wifiLv);
-
-    if (peerMacs.size() > 1 && !isPrivateCanvasActive()) {
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
-        tft.printf("%u/%u", (unsigned)(cur + 1), (unsigned)peerMacs.size());
-    } else if (isPrivateCanvasActive()) {
-        tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
-        tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
-        tft.print("tap");
-    } else if (wifiUp) {
-        // 显示本机 WiFi RSSI，不再用假延迟
-        int32_t ap = wifiApRssi();
-        tft.setTextColor(color, TFT_BLACK);
-        tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
-        if (ap != 0)
-            tft.printf("%d", (int)ap);
-        else
-            tft.print(linkModeIconLabel(wifiLv));
-    } else {
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 26);
-        tft.print(linkModeIconLabel(wifiLv));
-    }
+    tft.setTextColor(subCol, TFT_BLACK);
+    tft.setCursor(SIGNAL_INFO_X, SIGNAL_INFO_Y + 27);
+    tft.print(sub);
 }
 
 void updateSignalStrengthDisplay()
@@ -4630,13 +4627,37 @@ void hideChatRoom()
 {
     if (currentUIState != UI_STATE_CHAT)
         return;
+    // 含等待 SYNC_START：此时历史可能已清空，禁止用空历史整页重绘（否则白/空屏）
+    bool syncing = isReceivingDrawingData || isSendingDrawingData || iamRequestingAllData ||
+                   isAwaitingSyncStartResponse;
+    bool hadPending = pendingCanvasRedrawAfterChat;
     currentUIState = UI_STATE_MAIN;
     chatBannerMsg[0] = 0;
     privateChatOpen = false;
     groupChatOpen = false;
     chatDragStartY = -1;
+
+    if (syncing) {
+        // 同步未完成：只恢复主界面 UI，等 COMPLETE / 主循环再整页重放笔迹
+        pendingCanvasRedrawAfterChat = true;
+        tft.fillScreen(TFT_BLACK);
+        redrawUiChrome();
+        if (privInviteVisible)
+            drawPrivInviteDialog();
+        overlayGameInviteIfAny();
+        showStatusToast(isReceivingDrawingData ? "同步接收中…" :
+                        (isSendingDrawingData ? "同步发送中…" : "同步中…"),
+                        2000);
+        return;
+    }
+
     pendingCanvasRedrawAfterChat = false;
-    redrawMainScreen();
+    paintCurrentCanvasPage();
+    if (privInviteVisible)
+        drawPrivInviteDialog();
+    overlayGameInviteIfAny();
+    if (hadPending)
+        showStatusToast("画面已恢复", 1200);
 }
 
 static void appendInputUtf8(const char *utf8)

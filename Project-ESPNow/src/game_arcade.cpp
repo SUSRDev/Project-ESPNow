@@ -726,9 +726,40 @@ struct RadarContact_t {
 static const int RADAR_MAX = 8;
 static RadarContact_t radarContacts[RADAR_MAX];
 static int radarCount = 0;
+static int radarFocusIdx = 0; // 点选设定方位的目标
 
 // Cross-link RSSI: observer -> target (by contact index); -128 = unknown
 static int8_t radarLink[RADAR_MAX][RADAR_MAX];
+
+static int8_t radarFreshRssi(const char *id, int8_t fallback)
+{
+    if (!id || !id[0])
+        return fallback;
+    for (auto const &kv : peerInfoMap) {
+        const PeerInfo_t &p = kv.second;
+        if (p.deviceId[0] && strcmp(p.deviceId, id) == 0 && p.rssi != 0)
+            return p.rssi;
+    }
+    return fallback;
+}
+
+static void radarSetAz(int i, float angDeg, uint8_t conf, bool lock)
+{
+    if (i < 0 || i >= radarCount)
+        return;
+    while (angDeg < 0)
+        angDeg += 360.0f;
+    while (angDeg >= 360.0f)
+        angDeg -= 360.0f;
+    radarContacts[i].angleDeg = angDeg;
+    radarContacts[i].azValid = true;
+    radarContacts[i].azLocked = lock;
+    radarContacts[i].azConf = conf;
+    float a = angDeg * 0.01745329252f;
+    float d = radarContacts[i].distM > 0.1f ? radarContacts[i].distM : 1.0f;
+    radarContacts[i].posX = sinf(a) * d;
+    radarContacts[i].posY = cosf(a) * d;
+}
 
 static int radarFind(const char *id)
 {
@@ -751,7 +782,8 @@ static void radarUpsert(const char *id, int8_t rssi, uint16_t latMs)
         memset(&radarContacts[i], 0, sizeof(radarContacts[i]));
         strncpy(radarContacts[i].id, id, DEVICE_ID_MAX_LEN);
         radarContacts[i].id[DEVICE_ID_MAX_LEN] = '\0';
-        radarContacts[i].angleDeg = (radarCount <= 1) ? 0.0f : (360.0f * (float)i / (float)radarCount);
+        // 临时方位用 id hash，避免永远钉在正前方(0°)
+        radarContacts[i].angleDeg = (float)(idHash16(id) % 360);
         radarContacts[i].azValid = false;
         radarContacts[i].azLocked = false;
         radarContacts[i].azConf = 0;
@@ -911,27 +943,14 @@ static void radarRelayout()
             }
         }
         if (!placed) {
-            float slot = (radarCount <= 1) ? 0.0f : (360.0f * (float)i / (float)radarCount);
-            float prev = radarContacts[i].angleDeg;
-            float diff = slot - prev;
-            if (diff > 180)
-                diff -= 360;
-            if (diff < -180)
-                diff += 360;
-            radarContacts[i].angleDeg = prev + diff * 0.2f;
-            if (radarContacts[i].angleDeg < 0)
-                radarContacts[i].angleDeg += 360.0f;
-            if (radarContacts[i].angleDeg >= 360.0f)
-                radarContacts[i].angleDeg -= 360.0f;
+            // 未锁定：只按当前 angle 更新半径，绝不强行拉回 0°/正前方
             float a = radarContacts[i].angleDeg * 0.01745329252f;
             radarContacts[i].posX = sinf(a) * want;
             radarContacts[i].posY = cosf(a) * want;
-            if (!radarContacts[i].azLocked)
-                radarContacts[i].azValid = false;
         }
     }
 
-    // 弹簧微调未锁定节点
+    // 弹簧微调未锁定节点（有互距时）
     for (int iter = 0; iter < 8; iter++) {
         for (int i = 0; i < radarCount; i++) {
             if (radarContacts[i].azLocked)
@@ -943,8 +962,8 @@ static void radarRelayout()
             if (cur < 0.05f)
                 continue;
             float scale = want / cur;
-            radarContacts[i].posX *= (0.8f + 0.2f * scale);
-            radarContacts[i].posY *= (0.8f + 0.2f * scale);
+            radarContacts[i].posX *= (0.85f + 0.15f * scale);
+            radarContacts[i].posY *= (0.85f + 0.15f * scale);
         }
         for (int i = 0; i < radarCount; i++) {
             for (int j = i + 1; j < radarCount; j++) {
@@ -975,9 +994,12 @@ static void radarRelayout()
         }
     }
 
+    // 仅当未锁定且有互距几何时，才从 pos 回写 angle
     for (int i = 0; i < radarCount; i++) {
         if (radarContacts[i].azLocked)
             continue;
+        if (lockedN == 0)
+            continue; // 无锚点时保持原 angle，避免被算回 0°
         float ang = atan2f(radarContacts[i].posX, radarContacts[i].posY) * 57.2957795f;
         if (ang < 0)
             ang += 360.0f;
@@ -987,7 +1009,7 @@ static void radarRelayout()
             diff -= 360;
         if (diff < -180)
             diff += 360;
-        radarContacts[i].angleDeg = prev + diff * 0.25f;
+        radarContacts[i].angleDeg = prev + diff * 0.3f;
         if (radarContacts[i].angleDeg < 0)
             radarContacts[i].angleDeg += 360.0f;
         if (radarContacts[i].angleDeg >= 360.0f)
@@ -1019,11 +1041,14 @@ static void radarSyncFromPeers()
             }
             radarContacts[i] = radarContacts[radarCount - 1];
             radarCount--;
+            if (radarFocusIdx >= radarCount)
+                radarFocusIdx = radarCount ? radarCount - 1 : 0;
         } else {
             i++;
         }
     }
-    radarRelayout();
+    if (!radarCalibrating)
+        radarRelayout();
 }
 
 static void radarBroadcastLinks()
@@ -1435,6 +1460,7 @@ static void enterRadar()
 {
     arcadeView = ARCADE_RADAR;
     radarCount = 0;
+    radarFocusIdx = 0;
     radarSweepDeg = 0;
     radarPrevSweepDeg = -1;
     radarFrameReady = false;
@@ -1770,7 +1796,7 @@ static void radarDrawStaticFrame()
     // footer
     tft.fillRect(0, SCREEN_HEIGHT - 18, 214, 18, hdr);
     tft.setTextColor(TFT_GREENYELLOW, hdr);
-    tft.drawString("MODE SWEEP | 0=FWD", 4, SCREEN_HEIGHT - 14, 1);
+    tft.drawString("MODE SWEEP | TAP=AZ", 4, SCREEN_HEIGHT - 14, 1);
 
     radarFrameReady = true;
 }
@@ -1783,7 +1809,8 @@ static void radarDrawPanel()
     unsigned long now = millis();
     for (int i = 0; i < radarCount && ly < SCREEN_HEIGHT - 44; i++) {
         RadarContact_t &c = radarContacts[i];
-        cnDrawUtf8Ellipsis(tft, 218, ly, c.id, TFT_WHITE, 98);
+        uint16_t nameCol = (i == radarFocusIdx) ? TFT_YELLOW : TFT_WHITE;
+        cnDrawUtf8Ellipsis(tft, 218, ly, c.id, nameCol, 98);
 
         char dbuf[8];
         if (c.distM < 10.0f)
@@ -1832,11 +1859,11 @@ static void radarDrawPanel()
     }
     tft.setTextColor(TFT_ORANGE, panel);
     if (radarCalibrating)
-        tft.drawString("CAL: SLOW TURN", 218, SCREEN_HEIGHT - 34, 1);
+        tft.drawString("TURN: face peer", 218, SCREEN_HEIGHT - 34, 1);
     else if (radarCount && radarContacts[0].azLocked)
-        tft.drawString("AZ LOCKED", 218, SCREEN_HEIGHT - 34, 1);
+        tft.drawString("AZ OK tap=adj", 218, SCREEN_HEIGHT - 34, 1);
     else
-        tft.drawString("TAP CAL=TURN", 218, SCREEN_HEIGHT - 34, 1);
+        tft.drawString("CAL/TAP SCOPE", 218, SCREEN_HEIGHT - 34, 1);
 }
 
 static void radarRestoreScopeGrid()
@@ -2187,16 +2214,20 @@ void updateGameArcade()
             overlayGameInviteIfAny();
         }
     } else if (arcadeView == ARCADE_RADAR) {
-        // calibration: 缓慢转身一圈，RSSI 峰值方位 = 对方方向
+        // calibration: 转身采样 RSSI → 峰值方位；也可点盘面手动设方位
         if (radarCalibrating) {
             unsigned long elapsed = millis() - radarCalibStart;
+            // 校准中高频刷新 RSSI
+            radarSyncFromPeers();
+
             if (elapsed >= RADAR_CAL_MS) {
                 radarCalibrating = false;
                 for (int i = 0; i < radarCount; i++) {
-                    // 1) 收集各 bin 平均 RSSI
                     float avgs[RADAR_CAL_BINS];
                     int filled = 0;
                     float sumAll = 0;
+                    float peakAvg = -999.0f;
+                    int peakBin = 0;
                     for (int b = 0; b < RADAR_CAL_BINS; b++) {
                         if (radarContacts[i].calibN[b] == 0) {
                             avgs[b] = -999.0f;
@@ -2206,52 +2237,39 @@ void updateGameArcade()
                                   (float)radarContacts[i].calibN[b];
                         sumAll += avgs[b];
                         filled++;
+                        if (avgs[b] > peakAvg) {
+                            peakAvg = avgs[b];
+                            peakBin = b;
+                        }
                     }
-                    if (filled < 4)
+                    if (filled < 3 || peakAvg < -200.0f)
                         continue;
+
+                    // 主算法：峰值 bin + 邻域抛物线插值（比圆均值更稳）
+                    float peak = (float)peakBin;
+                    int bm = (peakBin + RADAR_CAL_BINS - 1) % RADAR_CAL_BINS;
+                    int bp = (peakBin + 1) % RADAR_CAL_BINS;
+                    float ym1 = (avgs[bm] > -200.0f) ? avgs[bm] : peakAvg - 5.0f;
+                    float yp1 = (avgs[bp] > -200.0f) ? avgs[bp] : peakAvg - 5.0f;
+                    float y0 = peakAvg;
+                    float denom = (ym1 - 2.0f * y0 + yp1);
+                    if (fabsf(denom) > 0.05f)
+                        peak += 0.5f * (ym1 - yp1) / denom;
+                    if (peak < 0)
+                        peak += (float)RADAR_CAL_BINS;
+                    if (peak >= (float)RADAR_CAL_BINS)
+                        peak -= (float)RADAR_CAL_BINS;
+
+                    float angDeg = peak * (360.0f / (float)RADAR_CAL_BINS);
                     float mean = sumAll / (float)filled;
-
-                    // 2) 加权圆均值（强调高于均值的方向）
-                    float sumSin = 0, sumCos = 0, wSum = 0;
-                    float peak = -999.0f;
-                    for (int b = 0; b < RADAR_CAL_BINS; b++) {
-                        if (avgs[b] < -200.0f)
-                            continue;
-                        if (avgs[b] > peak)
-                            peak = avgs[b];
-                        float w = avgs[b] - mean;
-                        if (w < 0.5f)
-                            continue;
-                        w = w * w; // 突出峰值
-                        float ang = ((float)b + 0.5f) * (360.0f / (float)RADAR_CAL_BINS) *
-                                    0.01745329252f;
-                        sumSin += w * sinf(ang);
-                        sumCos += w * cosf(ang);
-                        wSum += w;
-                    }
-                    if (wSum < 0.01f)
-                        continue;
-
-                    float angDeg = atan2f(sumSin, sumCos) * 57.2957795f;
-                    if (angDeg < 0)
-                        angDeg += 360.0f;
-
-                    // 3) 置信度：峰-均值差 + 覆盖度
-                    float prominence = peak - mean;
-                    int conf = (int)(prominence * 8.0f + (float)filled * 1.5f);
-                    if (conf < 20)
-                        conf = 20;
+                    float prominence = peakAvg - mean;
+                    int conf = (int)(prominence * 12.0f + (float)filled * 1.2f);
+                    if (conf < 25)
+                        conf = 25;
                     if (conf > 99)
                         conf = 99;
-
-                    // 低置信不硬锁，仍可显示
-                    radarContacts[i].angleDeg = angDeg;
-                    radarContacts[i].azValid = true;
-                    radarContacts[i].azConf = (uint8_t)conf;
-                    radarContacts[i].azLocked = (conf >= 35);
-                    float a = angDeg * 0.01745329252f;
-                    radarContacts[i].posX = sinf(a) * radarContacts[i].distM;
-                    radarContacts[i].posY = cosf(a) * radarContacts[i].distM;
+                    // 有峰值就锁定（ESP 天线弱方向性时仍给可用方位）
+                    radarSetAz(i, angDeg, (uint8_t)conf, true);
                 }
                 radarRelayout();
                 radarDrawPanel();
@@ -2262,17 +2280,43 @@ void updateGameArcade()
                     bin = 0;
                 if (bin >= RADAR_CAL_BINS)
                     bin = RADAR_CAL_BINS - 1;
+                float faceAng = ((float)bin + 0.5f) * (360.0f / (float)RADAR_CAL_BINS);
+
                 for (int i = 0; i < radarCount; i++) {
-                    int16_t sum = radarContacts[i].calibSum[bin] + (int16_t)radarContacts[i].rssi;
-                    uint8_t n = radarContacts[i].calibN[bin];
-                    if (n < 250) {
-                        radarContacts[i].calibSum[bin] = sum;
-                        radarContacts[i].calibN[bin] = (uint8_t)(n + 1);
+                    // 用对端原始 RSSI 入仓，避免 EMA 抹平峰值
+                    int8_t raw = radarFreshRssi(radarContacts[i].id, radarContacts[i].rssi);
+                    if (raw != 0) {
+                        radarContacts[i].rssi = raw;
+                        int16_t sum = radarContacts[i].calibSum[bin] + (int16_t)raw;
+                        uint8_t n = radarContacts[i].calibN[bin];
+                        if (n < 250) {
+                            radarContacts[i].calibSum[bin] = sum;
+                            radarContacts[i].calibN[bin] = (uint8_t)(n + 1);
+                        }
+                    }
+                    // 实时预览：当前最强 bin 的方位（光点会跟着跳）
+                    int bestB = -1;
+                    float bestA = -999.0f;
+                    for (int b = 0; b < RADAR_CAL_BINS; b++) {
+                        if (radarContacts[i].calibN[b] == 0)
+                            continue;
+                        float a = (float)radarContacts[i].calibSum[b] /
+                                  (float)radarContacts[i].calibN[b];
+                        if (a > bestA) {
+                            bestA = a;
+                            bestB = b;
+                        }
+                    }
+                    if (bestB >= 0) {
+                        float preview = ((float)bestB + 0.5f) * (360.0f / (float)RADAR_CAL_BINS);
+                        radarSetAz(i, preview, 40, false);
+                        radarContacts[i].azValid = true;
                     }
                 }
+
                 tft.fillRect(0, SCREEN_HEIGHT - 18, 214, 18, tft.color565(6, 32, 26));
-                char cb[40];
-                snprintf(cb, sizeof(cb), "SLOW TURN 360  %lu%%",
+                char cb[44];
+                snprintf(cb, sizeof(cb), "FACE FWD=%03.0f  %lu%%", (double)faceAng,
                          elapsed * 100UL / RADAR_CAL_MS);
                 tft.setTextColor(TFT_YELLOW, tft.color565(6, 32, 26));
                 tft.drawString(cb, 4, SCREEN_HEIGHT - 14, 1);
@@ -2288,6 +2332,12 @@ void updateGameArcade()
                 RadarContact_t &c = radarContacts[i];
                 float t = c.targetDistM > 0.01f ? c.targetDistM : c.distM;
                 c.distM = c.distM * 0.82f + t * 0.18f;
+                // 锁定后保持径向
+                if (c.azLocked) {
+                    float a = c.angleDeg * 0.01745329252f;
+                    c.posX = sinf(a) * c.distM;
+                    c.posY = cosf(a) * c.distM;
+                }
             }
             if (!radarFrameReady)
                 radarDrawStaticFrame();
@@ -2296,6 +2346,8 @@ void updateGameArcade()
         if (millis() - radarLastLayoutMs > 1200UL) {
             radarLastLayoutMs = millis();
             radarSyncFromPeers();
+            if (!radarCalibrating)
+                radarRelayout();
         }
         if (millis() - radarLastLinkTxMs > 1500UL) {
             radarLastLinkTxMs = millis();
@@ -2628,11 +2680,12 @@ bool handleGameArcadeTouch(int x, int y)
         return true;
     }
 
-    // Radar: CAL + INV + panel recruit
+    // Radar: CAL + INV + panel recruit + 点盘面设方位
     if (arcadeView == ARCADE_RADAR) {
         if (x >= 164 && x <= 208 && y >= 3 && y <= 22) {
             radarCalibrating = true;
             radarCalibStart = millis();
+            radarSyncFromPeers();
             for (int i = 0; i < radarCount; i++) {
                 for (int b = 0; b < RADAR_CAL_BINS; b++) {
                     radarContacts[i].calibSum[b] = 0;
@@ -2644,9 +2697,48 @@ bool handleGameArcadeTouch(int x, int y)
             }
             return true;
         }
-        if (x >= 214 && y >= SCREEN_HEIGHT - 40) {
-            sendGameRecruit(GAME_KIND_RADAR);
+        // 右侧列表点选目标
+        if (x >= 216) {
+            int ly = 42;
+            for (int i = 0; i < radarCount; i++) {
+                if (y >= ly && y < ly + 52) {
+                    radarFocusIdx = i;
+                    radarDrawPanel();
+                    return true;
+                }
+                ly += 52;
+            }
+            if (y >= SCREEN_HEIGHT - 40) {
+                sendGameRecruit(GAME_KIND_RADAR);
+                return true;
+            }
             return true;
+        }
+        // 点雷达盘面 → 把当前焦点目标设到该方位（可手动获得方位）
+        {
+            int dx = x - RADAR_CX;
+            int dy = RADAR_CY - y; // 屏上=前方
+            int rr = dx * dx + dy * dy;
+            int R2 = (RADAR_R + 6) * (RADAR_R + 6);
+            if (rr <= R2 && rr >= 36 && radarCount > 0) {
+                float ang = atan2f((float)dx, (float)dy) * 57.2957795f;
+                if (ang < 0)
+                    ang += 360.0f;
+                if (radarFocusIdx < 0 || radarFocusIdx >= radarCount)
+                    radarFocusIdx = 0;
+                radarSetAz(radarFocusIdx, ang, 98, true);
+                radarCalibrating = false;
+                radarDrawPanel();
+                radarDrawSweepAndBlips();
+                // 底部提示
+                tft.fillRect(0, SCREEN_HEIGHT - 18, 214, 18, tft.color565(6, 32, 26));
+                char tip[40];
+                snprintf(tip, sizeof(tip), "SET %s %03.0f",
+                         radarCardinal(ang), (double)ang);
+                tft.setTextColor(TFT_GREENYELLOW, tft.color565(6, 32, 26));
+                tft.drawString(tip, 4, SCREEN_HEIGHT - 14, 1);
+                return true;
+            }
         }
         return true;
     }

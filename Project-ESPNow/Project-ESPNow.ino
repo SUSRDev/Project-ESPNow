@@ -257,6 +257,14 @@ void loop()
         updateGameArcade();
     }
 
+    // 8e. 聊天期间积压的画板重绘，回主界面后补上（同步进行中历史可能为空，等 COMPLETE）
+    if (currentUIState == UI_STATE_MAIN && !inCustomColorMode && pendingCanvasRedrawAfterChat &&
+        !isReceivingDrawingData && !isSendingDrawingData && !iamRequestingAllData &&
+        !isAwaitingSyncStartResponse) {
+        pendingCanvasRedrawAfterChat = false;
+        paintCurrentCanvasPage();
+    }
+
     // 短暂延时，避免过于频繁的循环，给其他任务（如WiFi栈）一些时间
     // delay(1); // 可选，根据实际情况调整
 }

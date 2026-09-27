@@ -33,7 +33,8 @@ enum MessageType_e // 使用 _e 后缀表示 enum
     MSG_TYPE_PRIV_INVITE, // 私聊画板邀请
     MSG_TYPE_PRIV_ACCEPT, // 同意私聊画板
     MSG_TYPE_PRIV_REJECT, // 拒绝私聊画板
-    MSG_TYPE_PRIV_LEAVE   // 退出私聊画板
+    MSG_TYPE_PRIV_LEAVE,  // 退出私聊画板
+    MSG_TYPE_PRIV_RESUME  // 私聊对方重连：携带会话密钥，恢复私聊画板笔迹
 };
 typedef enum MessageType_e MessageType_t; // Typedef for the enum
 

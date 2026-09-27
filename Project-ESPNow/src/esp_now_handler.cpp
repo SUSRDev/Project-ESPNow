@@ -242,6 +242,10 @@ static void cancelSignalRecoveryFallback()
 
 static void beginRequestAllDrawings()
 {
+    // 私聊画板中禁止拉公屏历史（会清空私聊笔迹）
+    if (isPrivateCanvasActive())
+        return;
+
     unsigned long now = millis();
     iamEffectivelyMoreUptimeDevice = false;
     iamRequestingAllData = true;
@@ -409,6 +413,23 @@ void forcePushDrawingHistoryToPeers()
 
 void processPendingSignalRecoveryResync()
 {
+    // 私聊中：信号恢复只触发私聊 RESUME，不做公屏全量同步
+    if (isPrivateCanvasActive()) {
+        if (pendingSignalRecoveryResync) {
+            const String peerKey = pendingSignalRecoveryPeer;
+            pendingSignalRecoveryResync = false;
+            if (privPeerKeyMatches(peerKey) || peerKey.length() == 0)
+                offerPrivateCanvasResume();
+        }
+        if (signalRecoveryFallbackAtMs != 0 &&
+            (long)(millis() - signalRecoveryFallbackAtMs) >= 0) {
+            signalRecoveryFallbackAtMs = 0;
+            signalRecoveryAllowLargerMac = false;
+            offerPrivateCanvasResume();
+        }
+        return;
+    }
+
     // 大 MAC 等待对端发起超时后，自己兜底发起
     if (!pendingSignalRecoveryResync && signalRecoveryFallbackAtMs != 0 &&
         (long)(millis() - signalRecoveryFallbackAtMs) >= 0) {
@@ -914,6 +935,10 @@ static DrawingHistory publicHistoryBackup;
 static uint8_t publicPageBackup = 0;
 static uint8_t publicPageCountBackup = 1;
 static bool publicHistorySaved = false;
+// 私聊对方掉线/重启：保留本机私聊笔迹，对方上线后 RESUME 恢复
+static bool privPeerMarkedOffline = false;
+static unsigned long lastPrivResumeOfferMs = 0;
+static bool privResumeAwaitingAck = false;
 
 bool isPrivateCanvasActive() { return privPhase == PRIV_PHASE_ACTIVE; }
 bool isPrivateCanvasInvitePending()
@@ -945,6 +970,92 @@ static bool isPrivEncryptedDrawType(MessageType_t t)
 static bool privActivePeerMacEquals(const uint8_t mac[6])
 {
     return privPhase == PRIV_PHASE_ACTIVE && mac && memcmp(mac, privPeerMac, 6) == 0;
+}
+
+static bool privPeerKeyMatches(const String &peerKey)
+{
+    if (privPhase != PRIV_PHASE_ACTIVE || peerKey.length() == 0)
+        return false;
+    uint8_t mac[6];
+    if (!parseMacKey(peerKey, mac))
+        return false;
+    return memcmp(mac, privPeerMac, 6) == 0;
+}
+
+static String privPeerMacKey()
+{
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             privPeerMac[0], privPeerMac[1], privPeerMac[2],
+             privPeerMac[3], privPeerMac[4], privPeerMac[5]);
+    return String(macStr);
+}
+
+static void clearPrivResumeFlags()
+{
+    privPeerMarkedOffline = false;
+    lastPrivResumeOfferMs = 0;
+    privResumeAwaitingAck = false;
+}
+
+static void offerPrivateCanvasResume()
+{
+    if (privPhase != PRIV_PHASE_ACTIVE || !privPeerId[0])
+        return;
+    unsigned long now = millis();
+    if (lastPrivResumeOfferMs != 0 &&
+        (now - lastPrivResumeOfferMs) < PRIV_CANVAS_RESUME_OFFER_MS)
+        return;
+    lastPrivResumeOfferMs = now;
+    privResumeAwaitingAck = true;
+
+    PrivCanvasPacket_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.magic = PRIV_CANVAS_MAGIC;
+    pkt.type = MSG_TYPE_PRIV_RESUME;
+    strncpy(pkt.senderId, localDeviceId, DEVICE_ID_MAX_LEN);
+    strncpy(pkt.targetId, privPeerId, DEVICE_ID_MAX_LEN);
+    esp_wifi_get_mac(WIFI_IF_STA, pkt.senderMac);
+    // nonce 槽复用为会话密钥，供重启方直接恢复解密
+    memcpy(pkt.nonce, privSessionKey, 8);
+    pkt.timestamp = now;
+    ensureUnicastPeer(privPeerMac);
+    for (int i = 0; i < 3; i++) {
+        sendPrivCanvasPacket(&pkt, privPeerMac);
+        sendPrivCanvasPacket(&pkt, nullptr);
+        delay(12);
+    }
+    Serial.println("已发送私聊画板 RESUME（等待对方重连确认）");
+}
+
+static void sendPrivResumeAck()
+{
+    PrivCanvasPacket_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.magic = PRIV_CANVAS_MAGIC;
+    pkt.type = MSG_TYPE_PRIV_ACCEPT; // 复用 ACCEPT：在线方 ACTIVE 时视为重连确认
+    strncpy(pkt.senderId, localDeviceId, DEVICE_ID_MAX_LEN);
+    strncpy(pkt.targetId, privPeerId, DEVICE_ID_MAX_LEN);
+    esp_wifi_get_mac(WIFI_IF_STA, pkt.senderMac);
+    memcpy(pkt.nonce, privSessionKey, 8);
+    pkt.timestamp = millis();
+    for (int i = 0; i < 3; i++) {
+        sendPrivCanvasPacket(&pkt, privPeerMac);
+        sendPrivCanvasPacket(&pkt, nullptr);
+        delay(12);
+    }
+}
+
+static void pushPrivateHistoryAfterResume()
+{
+    if (privPhase != PRIV_PHASE_ACTIVE)
+        return;
+    String key = privPeerMacKey();
+    clearPeerCanvasSyncState(key);
+    privPeerMarkedOffline = false;
+    privResumeAwaitingAck = false;
+    forcePushDrawingHistoryToPeers();
+    showStatusToast("恢复私聊笔迹…", 2000);
 }
 
 static void xorEncryptSyncMessage(SyncMessage_t *msg)
@@ -1037,6 +1148,7 @@ static void enterPrivateActive(const char *peerId, const uint8_t peerMac[6],
 
     privPhase = PRIV_PHASE_ACTIVE;
     privInviteDeadlineMs = 0;
+    clearPrivResumeFlags();
     hidePrivInviteDialog();
 
     // 无论当前在列表/设置/聊天，都切回主界面私聊画板
@@ -1049,6 +1161,48 @@ static void enterPrivateActive(const char *peerId, const uint8_t peerMac[6],
     char tip[40];
     snprintf(tip, sizeof(tip), "私聊画板:%s", privPeerId);
     showStatusToast(tip, 2500);
+}
+
+// 重启方：用在线方下发的会话密钥直接重进私聊，等待对方推送笔迹
+static void enterPrivateResume(const char *peerId, const uint8_t peerMac[6],
+                               const uint8_t sessionKey[8])
+{
+    strncpy(privPeerId, peerId ? peerId : "Peer", DEVICE_ID_MAX_LEN);
+    privPeerId[DEVICE_ID_MAX_LEN] = '\0';
+    if (peerMac)
+        memcpy(privPeerMac, peerMac, 6);
+    if (sessionKey)
+        memcpy(privSessionKey, sessionKey, 8);
+    ensureUnicastPeer(privPeerMac);
+
+    // 中止可能正在进行的公屏同步，避免空/乱历史盖住即将恢复的私聊笔迹
+    iamRequestingAllData = false;
+    isReceivingDrawingData = false;
+    isAwaitingSyncStartResponse = false;
+    isSendingDrawingData = false;
+    hideReceiveProgress();
+    hideSendProgress();
+
+    if (!publicHistorySaved)
+        savePublicHistoryForPrivate();
+    else {
+        allDrawingHistory.clear();
+        clearCanvasRedoStack();
+        currentCanvasPage = 0;
+        canvasPageCount = 1;
+    }
+
+    clearPrivResumeFlags();
+    privPhase = PRIV_PHASE_ACTIVE;
+    privInviteDeadlineMs = 0;
+    hidePrivInviteDialog();
+
+    extern bool inCustomColorMode;
+    inCustomColorMode = false;
+    currentUIState = UI_STATE_MAIN;
+    paintCurrentCanvasPage();
+    onPrivateCanvasSessionChanged();
+    showStatusToast("已重连私聊画板", 2200);
 }
 
 static void sendPrivAcceptWithRetries()
@@ -1190,6 +1344,7 @@ void leavePrivateCanvas()
     memset(privPeerMac, 0, 6);
     memset(privSessionKey, 0, 8);
     privInviteDeadlineMs = 0;
+    clearPrivResumeFlags();
     hidePrivInviteDialog();
     showStatusToast("已退出私聊画板", 1800);
     onPrivateCanvasSessionChanged();
@@ -1199,20 +1354,29 @@ void leavePrivateCanvas()
 
 void checkPrivateCanvasTimeouts()
 {
-    if (privInviteDeadlineMs == 0)
+    if (privInviteDeadlineMs != 0 &&
+        (privPhase == PRIV_PHASE_OUTGOING || privPhase == PRIV_PHASE_INCOMING) &&
+        (long)(millis() - privInviteDeadlineMs) >= 0) {
+        if (privPhase == PRIV_PHASE_INCOMING)
+            hidePrivInviteDialog();
+        privPhase = PRIV_PHASE_IDLE;
+        privPeerId[0] = 0;
+        memset(privPeerMac, 0, 6);
+        privInviteDeadlineMs = 0;
+        clearPrivResumeFlags();
+        showStatusToast("私聊邀请超时", 2000);
+        onPrivateCanvasSessionChanged();
         return;
-    if (privPhase != PRIV_PHASE_OUTGOING && privPhase != PRIV_PHASE_INCOMING)
-        return;
-    if ((long)(millis() - privInviteDeadlineMs) < 0)
-        return;
-    if (privPhase == PRIV_PHASE_INCOMING)
-        hidePrivInviteDialog();
-    privPhase = PRIV_PHASE_IDLE;
-    privPeerId[0] = 0;
-    memset(privPeerMac, 0, 6);
-    privInviteDeadlineMs = 0;
-    showStatusToast("私聊邀请超时", 2000);
-    onPrivateCanvasSessionChanged();
+    }
+
+    // 私聊对方掉线后重新出现：主动发 RESUME，让对方重进并拉回笔迹
+    if (privPhase == PRIV_PHASE_ACTIVE && privPeerMarkedOffline) {
+        String key = privPeerMacKey();
+        auto hb = peerLastHeartbeat.find(key);
+        if (hb != peerLastHeartbeat.end() &&
+            (millis() - hb->second) < HEARTBEAT_TIMEOUT_MS)
+            offerPrivateCanvasResume();
+    }
 }
 
 static bool privIdEquals(const char *a, const char *b)
@@ -1245,9 +1409,9 @@ void processIncomingPrivPacket(const PrivCanvasPacket_t &pkt, const uint8_t srcM
 {
     if (pkt.magic != PRIV_CANVAS_MAGIC)
         return;
-    // 仅目标为本机的邀请/应答才处理（LEAVE 也校验会话）
+    // 仅目标为本机的邀请/应答才处理（LEAVE/RESUME 也校验）
     if (pkt.type == MSG_TYPE_PRIV_INVITE || pkt.type == MSG_TYPE_PRIV_ACCEPT ||
-        pkt.type == MSG_TYPE_PRIV_REJECT) {
+        pkt.type == MSG_TYPE_PRIV_REJECT || pkt.type == MSG_TYPE_PRIV_RESUME) {
         if (!privIdEquals(pkt.targetId, localDeviceId))
             return;
     }
@@ -1280,18 +1444,31 @@ void processIncomingPrivPacket(const PrivCanvasPacket_t &pkt, const uint8_t srcM
         break;
 
     case MSG_TYPE_PRIV_ACCEPT:
-        if (privPhase != PRIV_PHASE_OUTGOING)
-            return;
-        if (!privIdEquals(pkt.senderId, privPeerId))
-            return;
-        // 优先用包内 MAC（WiFi/MQTT 路径 srcMac 可能不准）
-        if (pkt.senderMac[0] || pkt.senderMac[1] || pkt.senderMac[2] ||
-            pkt.senderMac[3] || pkt.senderMac[4] || pkt.senderMac[5])
-            memcpy(privPeerMac, pkt.senderMac, 6);
-        else if (srcMac)
-            memcpy(privPeerMac, srcMac, 6);
-        // 邀请人：对方同意后同样进入空白私聊画板
-        enterPrivateActive(privPeerId, privPeerMac, privLocalNonce, pkt.nonce);
+        if (privPhase == PRIV_PHASE_OUTGOING) {
+            if (!privIdEquals(pkt.senderId, privPeerId))
+                return;
+            // 优先用包内 MAC（WiFi/MQTT 路径 srcMac 可能不准）
+            if (pkt.senderMac[0] || pkt.senderMac[1] || pkt.senderMac[2] ||
+                pkt.senderMac[3] || pkt.senderMac[4] || pkt.senderMac[5])
+                memcpy(privPeerMac, pkt.senderMac, 6);
+            else if (srcMac)
+                memcpy(privPeerMac, srcMac, 6);
+            // 邀请人：对方同意后同样进入空白私聊画板
+            enterPrivateActive(privPeerId, privPeerMac, privLocalNonce, pkt.nonce);
+            break;
+        }
+        // 本机仍在私聊：对方重启后回 ACK → 推送私聊笔迹
+        if (privPhase == PRIV_PHASE_ACTIVE &&
+            (privIdEquals(pkt.senderId, privPeerId) || macEqual(srcMac, privPeerMac))) {
+            if (pkt.senderMac[0] || pkt.senderMac[1] || pkt.senderMac[2] ||
+                pkt.senderMac[3] || pkt.senderMac[4] || pkt.senderMac[5])
+                memcpy(privPeerMac, pkt.senderMac, 6);
+            else if (srcMac)
+                memcpy(privPeerMac, srcMac, 6);
+            ensureUnicastPeer(privPeerMac);
+            pushPrivateHistoryAfterResume();
+            break;
+        }
         break;
 
     case MSG_TYPE_PRIV_REJECT:
@@ -1301,6 +1478,7 @@ void processIncomingPrivPacket(const PrivCanvasPacket_t &pkt, const uint8_t srcM
         privInviteDeadlineMs = 0;
         showStatusToast("对方拒绝私聊", 2000);
         privPeerId[0] = 0;
+        clearPrivResumeFlags();
         onPrivateCanvasSessionChanged();
         break;
 
@@ -1312,12 +1490,42 @@ void processIncomingPrivPacket(const PrivCanvasPacket_t &pkt, const uint8_t srcM
             privPeerId[0] = 0;
             memset(privPeerMac, 0, 6);
             memset(privSessionKey, 0, 8);
+            clearPrivResumeFlags();
             showStatusToast("对方退出私聊", 2000);
             onPrivateCanvasSessionChanged();
             if (currentUIState == UI_STATE_MAIN)
                 paintCurrentCanvasPage();
         }
         break;
+
+    case MSG_TYPE_PRIV_RESUME: {
+        // 重启方收到：自动加入私聊并回 ACK，等待在线方推送笔迹
+        uint8_t peerMac[6];
+        if (pkt.senderMac[0] || pkt.senderMac[1] || pkt.senderMac[2] ||
+            pkt.senderMac[3] || pkt.senderMac[4] || pkt.senderMac[5])
+            memcpy(peerMac, pkt.senderMac, 6);
+        else if (srcMac)
+            memcpy(peerMac, srcMac, 6);
+        else
+            break;
+
+        if (privPhase == PRIV_PHASE_ACTIVE &&
+            (privIdEquals(pkt.senderId, privPeerId) || macEqual(peerMac, privPeerMac))) {
+            // 已在同一私聊：刷新密钥并回 ACK
+            memcpy(privSessionKey, pkt.nonce, 8);
+            memcpy(privPeerMac, peerMac, 6);
+            ensureUnicastPeer(privPeerMac);
+            sendPrivResumeAck();
+            break;
+        }
+
+        if (privPhase == PRIV_PHASE_INCOMING)
+            hidePrivInviteDialog();
+        // 邀请中/空闲/其它：直接恢复进私聊
+        enterPrivateResume(pkt.senderId, peerMac, pkt.nonce);
+        sendPrivResumeAck();
+        break;
+    }
     default:
         break;
     }
@@ -1382,6 +1590,24 @@ void processIncomingMessages()
 
             String peerKey = macKeyFromLastPeer();
             detectPeerRebootAndAllowResync(peerKey, peerRawUptime);
+
+            // 私聊画板进行中：禁止公屏同步清掉私聊笔迹；对端重连则发 RESUME
+            if (isPrivateCanvasActive()) {
+                if (privPeerKeyMatches(peerKey)) {
+                    // reboot 检测已清 sync 标记，或曾掉线 → 发 RESUME
+                    if (privPeerMarkedOffline || peerNeedsCanvasSync(peerKey) ||
+                        privResumeAwaitingAck) {
+                        if (peerNeedsCanvasSync(peerKey))
+                            privPeerMarkedOffline = true;
+                        offerPrivateCanvasResume();
+                    }
+                    markPeerCanvasSynced(peerKey);
+                } else {
+                    markPeerCanvasSynced(peerKey);
+                }
+                break;
+            }
+
             if (!peerNeedsCanvasSync(peerKey)) {
                 break;
             }
@@ -1619,6 +1845,17 @@ void processIncomingMessages()
         {
             Serial.println("收到 MSG_TYPE_REQUEST_ALL_DRAWINGS.");
             const bool forceResync = (msg.touch_data.x == CANVAS_FORCE_RESYNC_FLAG);
+
+            // 私聊中：不走公屏请求路径（加密历史对方可能尚未恢复密钥）
+            // 对端重连由 PRIV_RESUME → ACCEPT → forcePush 完成
+            if (isPrivateCanvasActive()) {
+                if (privPeerKeyMatches(macKeyFromLastPeer()) ||
+                    privActivePeerMacEquals(lastPeerMac)) {
+                    offerPrivateCanvasResume();
+                }
+                break;
+            }
+
             if (forceResync) {
                 clearPeerCanvasSyncState(macKeyFromLastPeer());
                 cancelSignalRecoveryFallback();
@@ -1714,6 +1951,7 @@ void processIncomingMessages()
                     pendingCanvasRedrawAfterChat = true;
                 } else {
                     // 空闲同步结束：一次性重绘，无逐点动画
+                    pendingCanvasRedrawAfterChat = false;
                     paintCurrentCanvasPage();
                 }
 
@@ -1776,6 +2014,14 @@ void processIncomingMessages()
         {
             Serial.println("收到 MSG_TYPE_CLEAR_AND_REQUEST_UPDATE.");
             String peerKeyClear = macKeyFromLastPeer();
+
+            if (isPrivateCanvasActive()) {
+                if (privPeerKeyMatches(peerKeyClear))
+                    offerPrivateCanvasResume();
+                markPeerCanvasSynced(peerKeyClear);
+                break;
+            }
+
             const bool forceResync = (msg.touch_data.x == CANVAS_FORCE_RESYNC_FLAG);
             if (forceResync) {
                 clearPeerCanvasSyncState(peerKeyClear);
@@ -1834,8 +2080,10 @@ void processIncomingMessages()
             clearCanvasRedoStack();
             if (shouldSkipCanvasPaint())
                 pendingCanvasRedrawAfterChat = true;
-            else
+            else {
+                pendingCanvasRedrawAfterChat = false;
                 clearScreenAndCache();
+            }
             relativeBootTimeOffset = 0;
             iamEffectivelyMoreUptimeDevice = false;
             iamRequestingAllData = false;
@@ -2063,6 +2311,15 @@ void checkPeerHeartbeatTimeout()
         auto it = peerInfoMap.find(mac);
         if (it != peerInfoMap.end() && it->second.deviceId[0])
             leaveId = it->second.deviceId;
+
+        // 私聊对方掉线：保留私聊笔迹与会话，等待重启后 RESUME
+        if (privPhase == PRIV_PHASE_ACTIVE && privPeerKeyMatches(mac)) {
+            privPeerMarkedOffline = true;
+            privResumeAwaitingAck = false;
+            lastPrivResumeOfferMs = 0;
+            showStatusToast("私聊对方掉线", 2000);
+        }
+
         peerLeftNotify(leaveId);
 
         peerLastHeartbeat.erase(mac);

@@ -78,6 +78,7 @@
 // 私聊画板
 #define PRIV_CANVAS_INVITE_TIMEOUT_MS 30000UL
 #define PRIV_CANVAS_MAGIC 0xA5
+#define PRIV_CANVAS_RESUME_OFFER_MS 3000UL // 掉线重连后邀请恢复的最小间隔
 #define ONLINE_LIST_ROW_H 40
 #define ONLINE_LIST_TOP 30
 #define ONLINE_LIST_BOTTOM (SCREEN_HEIGHT - 30)
@@ -111,11 +112,11 @@
 // 在线列表刷新间隔
 #define ONLINE_PANEL_REFRESH_MS 500UL
 
-// 左侧信号强度显示
+// 左侧信号强度显示（加宽以完整显示中文短名 + RSSI）
 #define SIGNAL_INFO_X 1
 #define SIGNAL_INFO_Y (RECEIVE_PROGRESS_Y + PROGRESS_CIRCLE_RADIUS + 4)
-#define SIGNAL_INFO_W 30
-#define SIGNAL_INFO_H 28
+#define SIGNAL_INFO_W 52
+#define SIGNAL_INFO_H 36
 #define SIGNAL_PEER_ROTATE_MS 5000UL
 
 // 橡皮擦相关常量
