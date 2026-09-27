@@ -52,6 +52,12 @@ static bool isPrivEncryptedDrawType(MessageType_t t);
 static bool privActivePeerMacEquals(const uint8_t mac[6]);
 static bool privPeerKeyMatches(const String &peerKey);
 static void offerPrivateCanvasResume();
+// 私聊掉线恢复状态（需在 processPendingSignalRecoveryResync 之前可见）
+static bool privPeerMarkedOffline = false;
+static unsigned long lastPrivResumeOfferMs = 0;
+static bool privResumeAwaitingAck = false;
+static unsigned long lastPrivResumePushMs = 0;
+static unsigned long lastPrivResumeAckMs = 0;
 
 static String macKeyFromLastPeer()
 {
@@ -942,12 +948,6 @@ static DrawingHistory publicHistoryBackup;
 static uint8_t publicPageBackup = 0;
 static uint8_t publicPageCountBackup = 1;
 static bool publicHistorySaved = false;
-// 私聊对方掉线/重启：保留本机私聊笔迹，对方上线后 RESUME 恢复
-static bool privPeerMarkedOffline = false;
-static unsigned long lastPrivResumeOfferMs = 0;
-static bool privResumeAwaitingAck = false;
-static unsigned long lastPrivResumePushMs = 0;
-static unsigned long lastPrivResumeAckMs = 0;
 
 bool isPrivateCanvasActive() { return privPhase == PRIV_PHASE_ACTIVE; }
 bool isPrivateCanvasInvitePending()
