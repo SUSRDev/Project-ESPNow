@@ -137,9 +137,10 @@ static bool peerNeedsCanvasSync(const String &peerKey)
     return true;
 }
 
-// 检测对端 reboot：uptime 明显回落则强制允许恢复
-static void detectPeerRebootAndAllowResync(const String &peerKey, unsigned long peerRawUptime)
+// 检测对端 reboot：uptime 明显回落则强制允许恢复。返回是否判定为重启。
+static bool detectPeerRebootAndAllowResync(const String &peerKey, unsigned long peerRawUptime)
 {
+    bool rebooted = false;
     auto it = peerLastRawUptimeSeen.find(peerKey);
     if (it != peerLastRawUptimeSeen.end()) {
         unsigned long prev = it->second;
@@ -147,9 +148,11 @@ static void detectPeerRebootAndAllowResync(const String &peerKey, unsigned long 
         if (prev > 20000UL && peerRawUptime + 3000UL < prev) {
             clearPeerCanvasSyncState(peerKey);
             Serial.println("检测到对端 reboot，允许立即画板恢复");
+            rebooted = true;
         }
     }
     peerLastRawUptimeSeen[peerKey] = peerRawUptime;
+    return rebooted;
 }
 
 static void applySenderId(SyncMessage_t *msg)
@@ -415,19 +418,21 @@ void forcePushDrawingHistoryToPeers()
 
 void processPendingSignalRecoveryResync()
 {
-    // 私聊中：信号恢复只触发私聊 RESUME，不做公屏全量同步
+    // 私聊中：信号恢复只在对方曾掉线时 RESUME 一次
     if (isPrivateCanvasActive()) {
         if (pendingSignalRecoveryResync) {
             const String peerKey = pendingSignalRecoveryPeer;
             pendingSignalRecoveryResync = false;
-            if (privPeerKeyMatches(peerKey) || peerKey.length() == 0)
+            if (privPeerMarkedOffline &&
+                (privPeerKeyMatches(peerKey) || peerKey.length() == 0))
                 offerPrivateCanvasResume();
         }
         if (signalRecoveryFallbackAtMs != 0 &&
             (long)(millis() - signalRecoveryFallbackAtMs) >= 0) {
             signalRecoveryFallbackAtMs = 0;
             signalRecoveryAllowLargerMac = false;
-            offerPrivateCanvasResume();
+            if (privPeerMarkedOffline)
+                offerPrivateCanvasResume();
         }
         return;
     }
@@ -941,6 +946,8 @@ static bool publicHistorySaved = false;
 static bool privPeerMarkedOffline = false;
 static unsigned long lastPrivResumeOfferMs = 0;
 static bool privResumeAwaitingAck = false;
+static unsigned long lastPrivResumePushMs = 0;
+static unsigned long lastPrivResumeAckMs = 0;
 
 bool isPrivateCanvasActive() { return privPhase == PRIV_PHASE_ACTIVE; }
 bool isPrivateCanvasInvitePending()
@@ -998,15 +1005,23 @@ static void clearPrivResumeFlags()
     privPeerMarkedOffline = false;
     lastPrivResumeOfferMs = 0;
     privResumeAwaitingAck = false;
+    lastPrivResumePushMs = 0;
+    lastPrivResumeAckMs = 0;
 }
 
 static void offerPrivateCanvasResume()
 {
     if (privPhase != PRIV_PHASE_ACTIVE || !privPeerId[0])
         return;
+    // 仅掉线重连需要恢复；已恢复成功则不再发
+    if (!privPeerMarkedOffline && !privResumeAwaitingAck)
+        return;
     unsigned long now = millis();
     if (lastPrivResumeOfferMs != 0 &&
         (now - lastPrivResumeOfferMs) < PRIV_CANVAS_RESUME_OFFER_MS)
+        return;
+    // 刚推过笔迹：冷却，防止来回 RESUME/ACCEPT 刷屏
+    if (lastPrivResumePushMs != 0 && (now - lastPrivResumePushMs) < 20000UL)
         return;
     lastPrivResumeOfferMs = now;
     privResumeAwaitingAck = true;
@@ -1032,6 +1047,12 @@ static void offerPrivateCanvasResume()
 
 static void sendPrivResumeAck()
 {
+    unsigned long now = millis();
+    // 短时内只回一次 ACK，避免对端反复 forcePush
+    if (lastPrivResumeAckMs != 0 && (now - lastPrivResumeAckMs) < 8000UL)
+        return;
+    lastPrivResumeAckMs = now;
+
     PrivCanvasPacket_t pkt;
     memset(&pkt, 0, sizeof(pkt));
     pkt.magic = PRIV_CANVAS_MAGIC;
@@ -1040,7 +1061,7 @@ static void sendPrivResumeAck()
     strncpy(pkt.targetId, privPeerId, DEVICE_ID_MAX_LEN);
     esp_wifi_get_mac(WIFI_IF_STA, pkt.senderMac);
     memcpy(pkt.nonce, privSessionKey, 8);
-    pkt.timestamp = millis();
+    pkt.timestamp = now;
     for (int i = 0; i < 3; i++) {
         sendPrivCanvasPacket(&pkt, privPeerMac);
         sendPrivCanvasPacket(&pkt, nullptr);
@@ -1052,10 +1073,20 @@ static void pushPrivateHistoryAfterResume()
 {
     if (privPhase != PRIV_PHASE_ACTIVE)
         return;
-    String key = privPeerMacKey();
-    clearPeerCanvasSyncState(key);
+    // 必须确实在等恢复，且短时内未推过
+    if (!privPeerMarkedOffline && !privResumeAwaitingAck)
+        return;
+    unsigned long now = millis();
+    if (lastPrivResumePushMs != 0 && (now - lastPrivResumePushMs) < 20000UL) {
+        privPeerMarkedOffline = false;
+        privResumeAwaitingAck = false;
+        return;
+    }
+    lastPrivResumePushMs = now;
     privPeerMarkedOffline = false;
     privResumeAwaitingAck = false;
+    // 勿 clearPeerCanvasSyncState：否则下一次 UPTIME 又会当成需要恢复
+    markPeerCanvasSynced(privPeerMacKey());
     forcePushDrawingHistoryToPeers();
     showStatusToast("恢复私聊笔迹…", 2000);
 }
@@ -1591,18 +1622,15 @@ void processIncomingMessages()
             initialSyncLogicProcessed = true;
 
             String peerKey = macKeyFromLastPeer();
-            detectPeerRebootAndAllowResync(peerKey, peerRawUptime);
+            const bool peerRebooted = detectPeerRebootAndAllowResync(peerKey, peerRawUptime);
 
-            // 私聊画板进行中：禁止公屏同步清掉私聊笔迹；对端重连则发 RESUME
+            // 私聊画板进行中：禁止公屏同步清掉私聊笔迹；仅掉线/重启才 RESUME 一次
             if (isPrivateCanvasActive()) {
                 if (privPeerKeyMatches(peerKey)) {
-                    // reboot 检测已清 sync 标记，或曾掉线 → 发 RESUME
-                    if (privPeerMarkedOffline || peerNeedsCanvasSync(peerKey) ||
-                        privResumeAwaitingAck) {
-                        if (peerNeedsCanvasSync(peerKey))
-                            privPeerMarkedOffline = true;
+                    if (peerRebooted)
+                        privPeerMarkedOffline = true;
+                    if (privPeerMarkedOffline)
                         offerPrivateCanvasResume();
-                    }
                     markPeerCanvasSynced(peerKey);
                 } else {
                     markPeerCanvasSynced(peerKey);
@@ -1848,11 +1876,11 @@ void processIncomingMessages()
             Serial.println("收到 MSG_TYPE_REQUEST_ALL_DRAWINGS.");
             const bool forceResync = (msg.touch_data.x == CANVAS_FORCE_RESYNC_FLAG);
 
-            // 私聊中：不走公屏请求路径（加密历史对方可能尚未恢复密钥）
-            // 对端重连由 PRIV_RESUME → ACCEPT → forcePush 完成
+            // 私聊中：不走公屏请求路径；仅掉线重连时发 RESUME
             if (isPrivateCanvasActive()) {
-                if (privPeerKeyMatches(macKeyFromLastPeer()) ||
-                    privActivePeerMacEquals(lastPeerMac)) {
+                if ((privPeerKeyMatches(macKeyFromLastPeer()) ||
+                     privActivePeerMacEquals(lastPeerMac)) &&
+                    privPeerMarkedOffline) {
                     offerPrivateCanvasResume();
                 }
                 break;
@@ -2018,7 +2046,7 @@ void processIncomingMessages()
             String peerKeyClear = macKeyFromLastPeer();
 
             if (isPrivateCanvasActive()) {
-                if (privPeerKeyMatches(peerKeyClear))
+                if (privPeerMarkedOffline && privPeerKeyMatches(peerKeyClear))
                     offerPrivateCanvasResume();
                 markPeerCanvasSynced(peerKeyClear);
                 break;
