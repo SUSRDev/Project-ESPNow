@@ -13,8 +13,12 @@ enum GameKind_e {
     GAME_KIND_RPS = 1,
     GAME_KIND_MOLE = 2,
     GAME_KIND_RADAR = 3,
-    GAME_KIND_REACT = 4,  // 比反应
-    GAME_KIND_BRIDGE = 5  // 恐龙搭桥
+    GAME_KIND_REACT = 4,     // 比反应
+    GAME_KIND_BRIDGE = 5,    // 恐龙搭桥
+    GAME_KIND_HOCKEY = 6,    // 空气曲棍球
+    GAME_KIND_RHYTHM = 7,    // 节奏点拍
+    GAME_KIND_WEREWOLF = 8,  // 狼人杀（多人）
+    GAME_KIND_SOUP = 9       // 海龟汤（情境推理）
 };
 typedef enum GameKind_e GameKind_t;
 
@@ -34,7 +38,12 @@ typedef enum GameOpcode_e GameOpcode_t;
 
 #define GAME_WIN_SCORE 10
 #define GAME_RPS_ROUND_MS 30000UL
-#define GAME_STAT_KIND_N 4 // RPS MOLE REACT BRIDGE
+#define GAME_STAT_KIND_N 8 // +SOUP
+#define GAME_WW_MIN_PLAYERS 3
+#define GAME_WW_MAX_PLAYERS 12
+#define GAME_HOCKEY_WIN 7
+#define GAME_RHYTHM_WIN 10
+#define GAME_SOUP_MIN_PLAYERS 2
 
 #define GAME_INVITE_TIMEOUT_MS 30000UL
 #define GAME_INVITE_POPUP_W 280

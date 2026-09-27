@@ -1,4 +1,5 @@
 #include "game_arcade.h"
+#include "game_arcade_more.h"
 #include "ui_manager.h"
 #include "cn_text.h"
 #include "transport_manager.h"
@@ -22,6 +23,10 @@ enum ArcadeView_e {
     ARCADE_RADAR,
     ARCADE_REACT,
     ARCADE_BRIDGE,
+    ARCADE_HOCKEY,
+    ARCADE_RHYTHM,
+    ARCADE_WEREWOLF,
+    ARCADE_SOUP,
     ARCADE_MY_STATS,
     ARCADE_BOARD,
     ARCADE_PEER_STATS
@@ -33,7 +38,7 @@ static bool arcadeFingerDown = false;
 static uint32_t gameSeq = 1;
 static int lobbyScrollY = 0;
 static const int LOBBY_ITEM_H = 40;
-static const int LOBBY_N = 5;
+static const int LOBBY_N = 9;
 static volatile bool gameUiDirty = false;
 static int statsScrollY = 0;
 static char statsPeerId[DEVICE_ID_MAX_LEN + 1] = {0};
@@ -132,33 +137,17 @@ static Preferences gameStatPrefs;
 
 static int statsKindIndex(uint8_t gameKind)
 {
-    switch (gameKind) {
-    case GAME_KIND_RPS: return 0;
-    case GAME_KIND_MOLE: return 1;
-    case GAME_KIND_REACT: return 2;
-    case GAME_KIND_BRIDGE: return 3;
-    default: return -1;
-    }
+    return moreStatsKindToIndex(gameKind);
 }
 
 static uint8_t statsIndexToKind(int idx)
 {
-    static const uint8_t kinds[GAME_STAT_KIND_N] = {
-        GAME_KIND_RPS, GAME_KIND_MOLE, GAME_KIND_REACT, GAME_KIND_BRIDGE};
-    if (idx < 0 || idx >= GAME_STAT_KIND_N)
-        return GAME_KIND_NONE;
-    return kinds[idx];
+    return moreStatsIndexToKind(idx);
 }
 
 static const char *statsKindShort(int idx)
 {
-    switch (idx) {
-    case 0: return "RPS";
-    case 1: return "MOLE";
-    case 2: return "REACT";
-    case 3: return "BRIDGE";
-    default: return "?";
-    }
+    return moreStatsKindShort(idx);
 }
 
 static void statsClearPlayer(PlayerStats_t &p, const char *id)
@@ -1242,6 +1231,10 @@ void drawGameLobby()
         {"RF DEVICE RADAR", "设备雷达", tft.color565(200, 80, 40)},
         {"REACTION RACE", "比反应", tft.color565(220, 160, 40)},
         {"DINO BRIDGE", "恐龙搭桥", tft.color565(120, 80, 200)},
+        {"AIR HOCKEY", "空气曲棍球", tft.color565(40, 140, 200)},
+        {"RHYTHM TAP", "节奏点拍", tft.color565(180, 60, 160)},
+        {"WEREWOLF", "狼人杀多人", tft.color565(140, 40, 50)},
+        {"TURTLE SOUP", "海龟汤推理", tft.color565(30, 120, 90)},
     };
     int listTop = 28;
     int viewH = SCREEN_HEIGHT - listTop;
@@ -1511,6 +1504,14 @@ static void leaveCurrentGame()
         sendGamePacket(GAME_KIND_REACT, GAME_OP_LEAVE, 0, 0, 0, 0);
     else if (arcadeView == ARCADE_BRIDGE)
         sendGamePacket(GAME_KIND_BRIDGE, GAME_OP_LEAVE, 0, 0, 0, 0);
+    else if (arcadeView == ARCADE_HOCKEY)
+        hockeyLeave();
+    else if (arcadeView == ARCADE_RHYTHM)
+        rhythmLeave();
+    else if (arcadeView == ARCADE_WEREWOLF)
+        werewolfLeave();
+    else if (arcadeView == ARCADE_SOUP)
+        soupLeave();
 }
 
 static void drawRpsScreen()
@@ -2111,6 +2112,10 @@ static void redrawArcade()
     case ARCADE_RADAR: drawRadarScreen(true); break;
     case ARCADE_REACT: drawReactScreen(); break;
     case ARCADE_BRIDGE: drawBridgeScreen(); break;
+    case ARCADE_HOCKEY: hockeyDraw(); break;
+    case ARCADE_RHYTHM: rhythmDraw(); break;
+    case ARCADE_WEREWOLF: werewolfDraw(); break;
+    case ARCADE_SOUP: soupDraw(); break;
     case ARCADE_MY_STATS:
         drawStatsProfile(localDeviceId, true);
         break;
@@ -2177,6 +2182,14 @@ void updateGameArcade()
         } else if (arcadeView == ARCADE_BRIDGE) {
             sendGamePacket(GAME_KIND_BRIDGE, GAME_OP_JOIN, (int16_t)bridgeScore, 0, 0, 0);
             sendGamePacket(GAME_KIND_BRIDGE, GAME_OP_SCORE, (int16_t)bridgeScore, 1, 0, 0);
+        } else if (arcadeView == ARCADE_HOCKEY) {
+            moreSendGamePacket(GAME_KIND_HOCKEY, GAME_OP_JOIN, 0, 0, 0, 0);
+        } else if (arcadeView == ARCADE_RHYTHM) {
+            moreSendGamePacket(GAME_KIND_RHYTHM, GAME_OP_JOIN, 0, 0, 0, 0);
+        } else if (arcadeView == ARCADE_WEREWOLF) {
+            moreSendGamePacket(GAME_KIND_WEREWOLF, GAME_OP_JOIN, 0, 0, 0, 0);
+        } else if (arcadeView == ARCADE_SOUP) {
+            moreSendGamePacket(GAME_KIND_SOUP, GAME_OP_JOIN, 0, 0, 0, 0);
         } else if (arcadeView == ARCADE_RADAR) {
             radarBroadcastLinks();
         }
@@ -2473,6 +2486,14 @@ void updateGameArcade()
             drawBridgeScreen();
             overlayGameInviteIfAny();
         }
+    } else if (arcadeView == ARCADE_HOCKEY) {
+        hockeyUpdate();
+    } else if (arcadeView == ARCADE_RHYTHM) {
+        rhythmUpdate();
+    } else if (arcadeView == ARCADE_WEREWOLF) {
+        werewolfUpdate();
+    } else if (arcadeView == ARCADE_SOUP) {
+        soupUpdate();
     }
     updateRecruitToast();
 }
@@ -2494,6 +2515,47 @@ bool handleGameArcadeTouch(int x, int y)
     }
 
     // bridge: allow hold (not only rising) for grow start
+    if (arcadeView == ARCADE_HOCKEY) {
+        if (!rising)
+            return hockeyTouch(x, y, false);
+        if (!hockeyTouch(x, y, true)) {
+            leaveCurrentGame();
+            arcadeView = ARCADE_LOBBY;
+            drawGameLobby();
+        }
+        return true;
+    }
+    if (arcadeView == ARCADE_RHYTHM) {
+        if (!rising)
+            return true;
+        if (!rhythmTouch(x, y, true)) {
+            leaveCurrentGame();
+            arcadeView = ARCADE_LOBBY;
+            drawGameLobby();
+        }
+        return true;
+    }
+    if (arcadeView == ARCADE_WEREWOLF) {
+        if (!rising)
+            return true;
+        if (!werewolfTouch(x, y, true)) {
+            leaveCurrentGame();
+            arcadeView = ARCADE_LOBBY;
+            drawGameLobby();
+        }
+        return true;
+    }
+    if (arcadeView == ARCADE_SOUP) {
+        if (!rising)
+            return true;
+        if (!soupTouch(x, y, true)) {
+            leaveCurrentGame();
+            arcadeView = ARCADE_LOBBY;
+            drawGameLobby();
+        }
+        return true;
+    }
+
     if (arcadeView == ARCADE_BRIDGE) {
         if (hitBack(x, y) && rising) {
             leaveCurrentGame();
@@ -2660,9 +2722,11 @@ bool handleGameArcadeTouch(int x, int y)
             int rowY = listTop + idx * LOBBY_ITEM_H - lobbyScrollY;
             if (x >= SCREEN_WIDTH - 78 && x <= SCREEN_WIDTH - 42 &&
                 y >= rowY + 10 && y <= rowY + 28) {
-                static const uint8_t kinds[5] = {
+                static const uint8_t kinds[9] = {
                     GAME_KIND_MOLE, GAME_KIND_RPS, GAME_KIND_RADAR,
-                    GAME_KIND_REACT, GAME_KIND_BRIDGE};
+                    GAME_KIND_REACT, GAME_KIND_BRIDGE,
+                    GAME_KIND_HOCKEY, GAME_KIND_RHYTHM, GAME_KIND_WEREWOLF,
+                    GAME_KIND_SOUP};
                 sendGameRecruit(kinds[idx]);
                 return true;
             }
@@ -2674,8 +2738,21 @@ bool handleGameArcadeTouch(int x, int y)
                 enterRadar();
             else if (idx == 3)
                 enterReact();
-            else
+            else if (idx == 4)
                 enterBridge();
+            else if (idx == 5) {
+                arcadeView = ARCADE_HOCKEY;
+                hockeyEnter();
+            } else if (idx == 6) {
+                arcadeView = ARCADE_RHYTHM;
+                rhythmEnter();
+            } else if (idx == 7) {
+                arcadeView = ARCADE_WEREWOLF;
+                werewolfEnter();
+            } else {
+                arcadeView = ARCADE_SOUP;
+                soupEnter();
+            }
         }
         return true;
     }
@@ -2888,6 +2965,8 @@ void gameArcadeTouchReleased()
         bridgePhase = BRIDGE_FALL;
         bridgeDirty = true;
     }
+    if (arcadeView == ARCADE_HOCKEY)
+        hockeyTouchReleased();
     arcadeFingerDown = false;
 }
 
@@ -2910,6 +2989,14 @@ void processIncomingGameQueue()
             drawReactScreen();
         } else if (arcadeView == ARCADE_BRIDGE) {
             drawBridgeScreen();
+        } else if (arcadeView == ARCADE_HOCKEY) {
+            hockeyDraw();
+        } else if (arcadeView == ARCADE_RHYTHM) {
+            rhythmDraw();
+        } else if (arcadeView == ARCADE_WEREWOLF) {
+            werewolfDraw();
+        } else if (arcadeView == ARCADE_SOUP) {
+            soupDraw();
         } else if (arcadeView == ARCADE_BOARD) {
             drawLeaderboard();
         } else if (arcadeView == ARCADE_PEER_STATS) {
@@ -3139,6 +3226,31 @@ static void applyIncomingGamePacket(const GamePacket_t &pkt, int8_t rssi)
         if (arcadeView == ARCADE_BRIDGE)
             gameUiDirty = true;
     }
+
+    if (pkt.gameKind == GAME_KIND_HOCKEY) {
+        hockeyApplyPacket(pkt);
+        if (arcadeView == ARCADE_HOCKEY)
+            gameUiDirty = true;
+        return;
+    }
+    if (pkt.gameKind == GAME_KIND_RHYTHM) {
+        rhythmApplyPacket(pkt);
+        if (arcadeView == ARCADE_RHYTHM)
+            gameUiDirty = true;
+        return;
+    }
+    if (pkt.gameKind == GAME_KIND_WEREWOLF) {
+        werewolfApplyPacket(pkt);
+        if (arcadeView == ARCADE_WEREWOLF)
+            gameUiDirty = true;
+        return;
+    }
+    if (pkt.gameKind == GAME_KIND_SOUP) {
+        soupApplyPacket(pkt);
+        if (arcadeView == ARCADE_SOUP)
+            gameUiDirty = true;
+        return;
+    }
 }
 
 // ===== Game recruit / invite (all-page overlay) =====
@@ -3157,6 +3269,10 @@ const char *gameKindDisplayName(uint8_t kind)
     case GAME_KIND_RADAR: return "RF RADAR";
     case GAME_KIND_REACT: return "REACTION";
     case GAME_KIND_BRIDGE: return "DINO BRIDGE";
+    case GAME_KIND_HOCKEY: return "AIR HOCKEY";
+    case GAME_KIND_RHYTHM: return "RHYTHM TAP";
+    case GAME_KIND_WEREWOLF: return "WEREWOLF";
+    case GAME_KIND_SOUP: return "TURTLE SOUP";
     default: return "GAME";
     }
 }
@@ -3221,6 +3337,10 @@ static uint8_t arcadeRecruitKind()
     case ARCADE_RADAR: return GAME_KIND_RADAR;
     case ARCADE_REACT: return GAME_KIND_REACT;
     case ARCADE_BRIDGE: return GAME_KIND_BRIDGE;
+    case ARCADE_HOCKEY: return GAME_KIND_HOCKEY;
+    case ARCADE_RHYTHM: return GAME_KIND_RHYTHM;
+    case ARCADE_WEREWOLF: return GAME_KIND_WEREWOLF;
+    case ARCADE_SOUP: return GAME_KIND_SOUP;
     default: return GAME_KIND_NONE;
     }
 }
@@ -3376,7 +3496,19 @@ bool handleGameInviteTouch(int x, int y)
                 enterReact();
             else if (kind == GAME_KIND_BRIDGE)
                 enterBridge();
-            else
+            else if (kind == GAME_KIND_HOCKEY) {
+                arcadeView = ARCADE_HOCKEY;
+                hockeyEnter();
+            } else if (kind == GAME_KIND_RHYTHM) {
+                arcadeView = ARCADE_RHYTHM;
+                rhythmEnter();
+            } else if (kind == GAME_KIND_WEREWOLF) {
+                arcadeView = ARCADE_WEREWOLF;
+                werewolfEnter();
+            } else if (kind == GAME_KIND_SOUP) {
+                arcadeView = ARCADE_SOUP;
+                soupEnter();
+            } else
                 showGameLobby();
             return true;
         }
