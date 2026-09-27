@@ -50,6 +50,8 @@ static bool signalRecoveryAllowLargerMac = false;
 static void xorDecryptIncomingSync(SyncMessage_t *msg);
 static bool isPrivEncryptedDrawType(MessageType_t t);
 static bool privActivePeerMacEquals(const uint8_t mac[6]);
+static bool privPeerKeyMatches(const String &peerKey);
+static void offerPrivateCanvasResume();
 
 static String macKeyFromLastPeer()
 {
